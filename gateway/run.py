@@ -2255,6 +2255,7 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.claude_auto_routing import GatewayClaudeAutoRoutingMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -5637,7 +5638,12 @@ class TurnRunner:
 
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(
+    GatewayAuthorizationMixin,
+    GatewayClaudeAutoRoutingMixin,
+    GatewayKanbanWatchersMixin,
+    GatewaySlashCommandsMixin,
+):
     """
     Main gateway controller.
 
@@ -15537,6 +15543,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "accepting new turns right now. It'll be back in a moment — "
                 "please resend shortly."
             )
+
+        # ── Configurable automatic Claude Code routing (claude_routing) ──
+        # Reached only for plain, non-command, non-internal text that would
+        # otherwise become a normal agent turn: every explicit command
+        # (built-in, quick, plugin, skill/bundle) has already returned
+        # above, and the drain gates have already had their say. If this
+        # channel is configured for auto-routing, hand the message to
+        # Claude Code instead of the Hermes/OpenAI agent loop -- see
+        # gateway/claude_auto_routing.py. A "chat:" bypass rewrites
+        # event.text and returns None here, falling through to the normal
+        # agent loop below exactly as if auto-routing were never checked.
+        if not command and not is_internal:
+            _auto_route_result = await self._maybe_auto_route_to_claude(event, source)
+            if _auto_route_result is not None:
+                return _auto_route_result
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there

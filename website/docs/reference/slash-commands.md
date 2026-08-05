@@ -295,6 +295,8 @@ Only for the explicit, deliberate case where you want a *separate*, already-runn
 - The command replies twice: an immediate "delegating..." acknowledgement naming the worker and workspace, then a follow-up once the worker responds (or times out / reports busy / needs re-authentication / has no live session).
 - The follow-up contains only the worker's own reply text — no pane history, prompts, tokens, or ANSI control sequences.
 
+Want ordinary messages in a whole channel to go straight to a Claude Code worker, without typing `/cc-delegate` every time? See [Automatic Claude Code Routing](/user-guide/features/claude-code-auto-routing) — it's opt-in per Discord channel via `config.yaml`'s `claude_routing`, off by default, and every explicit command (including `/cc-delegate` itself) still works normally in an auto-routed channel.
+
 ## Notes
 
 - `/skin`, `/snapshot`, `/reload`, `/tools`, `/toolsets`, `/browser`, `/config`, `/cron`, `/platforms`, `/paste`, `/image`, `/statusbar`, `/battery`, `/focus`, `/plugins`, `/busy`, `/indicator`, `/wake`, `/journey`, `/redraw`, `/clear`, `/history`, `/save`, `/copy`, `/handoff`, `/prompt`, `/pet`, `/hatch`, `/timestamps`, `/subscription`, and `/quit` are **CLI-only** commands.

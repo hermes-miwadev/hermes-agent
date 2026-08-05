@@ -1,0 +1,125 @@
+---
+title: Automatic Claude Code Routing (Discord)
+sidebar_label: Claude Code Auto-Routing
+description: "Configure a Discord channel so ordinary messages are delegated straight to a Claude Code worker instead of Hermes' own agent loop"
+---
+
+# Automatic Claude Code Routing
+
+Lets you mark a specific Discord channel so that ordinary messages there are delegated straight to an authenticated [Claude Code](https://code.claude.com/docs/en/cli-reference) tmux worker instead of going through Hermes' own agent loop. It builds entirely on the existing [Claude Code tmux bridge](/reference/slash-commands#delegating-to-a-claude-code-worker-cc-delegate) — nothing here talks to tmux or Discord directly, and every message still goes through the same worker allowlisting, workspace containment, per-session locking, approval-required detection, response extraction, and sanitisation that `/cc-delegate` uses.
+
+Unlike `/cc-delegate`, which is something *you* type explicitly, auto-routing fires on **plain messages** in a channel you've opted in — so a channel dedicated to one repo's ongoing work can feel like talking directly to Claude Code, without retyping `/cc-delegate` every time.
+
+## Nothing is on by default
+
+No channel is auto-routed until you add a `claude_routing` entry to `config.yaml` (below). Without that config, this feature does nothing — every message goes through Hermes exactly as it always has.
+
+## Configuration
+
+Add a `claude_routing` list to `~/.hermes/config.yaml`:
+
+```yaml
+claude_routing:
+  - platform: discord
+    channel_id: "123456789012345678"   # the Discord channel's ID (Developer Mode -> right-click -> Copy Channel ID)
+    enabled: true
+    worker: claude-momentum             # must be a session registered in agent/claude_code_tmux_bridge.py
+    workspace: /home/michael/code/momentum-studio  # must be the worker's root or a subdirectory of it
+    mode: claude_default
+    standard_instructions: true         # true (default block), false (omit), or custom text
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `platform` | no (defaults to `discord`) | Currently only `discord` is supported. |
+| `channel_id` | **yes** | The Discord channel's numeric ID. Messages in threads under this channel match too. |
+| `enabled` | no (defaults to `true`) | Set `false` to turn a mapping off without deleting it. |
+| `worker` | **yes** | A session name already registered with the tmux bridge (`claude-momentum` ships by default). Unregistered names are rejected, not guessed at. |
+| `workspace` | **yes** | An absolute path that must resolve to the worker's configured workspace root or a subdirectory of it. Anything else is rejected before it reaches the worker. |
+| `mode` | no (defaults to `claude_default`) | See [Routing modes](#routing-modes) below. |
+| `standard_instructions` | no (defaults to `true`) | `true` includes the built-in requirements block (below); `false` omits it; any other string is used verbatim instead. |
+
+Restart the gateway (`hermes gateway restart`) after editing `claude_routing` — it's read from the loaded config, the same as `quick_commands`.
+
+**Do not hardcode a channel ID in source.** The registry only exists in your own `config.yaml`; nothing in the Hermes codebase references a specific channel.
+
+### Momentum Studio example
+
+The exact block to add for delegating the Momentum Studio channel to the `claude-momentum` worker:
+
+```yaml
+claude_routing:
+  - platform: discord
+    channel_id: "REPLACE_WITH_YOUR_CHANNEL_ID"
+    enabled: true
+    worker: claude-momentum
+    workspace: /home/michael/code/momentum-studio
+    mode: claude_default
+```
+
+## Routing modes
+
+`claude_default` is the only mode implemented so far: **deterministic, unconditional** delegation. Every plain-text message in the channel that isn't a command and doesn't use the `chat:` bypass goes straight to the configured worker — there's no content-based classification deciding whether a given message "looks like a coding task." That's intentional: an operator opts a whole channel in, rather than Hermes guessing per-message.
+
+## Standard implementation instructions
+
+Unless a mapping sets `standard_instructions: false`, every auto-routed prompt is prefixed with:
+
+> Standard implementation requirements for this task: inspect the current repository state first; use a new branch or an isolated worktree; do not make unrelated changes; run relevant tests and checks; commit intentionally; push the branch; create or update a pull request; and report the branch, commit, PR link, files changed, and tests run.
+
+This is advisory framing text, not a rule enforced in code — Claude Code is an agent in its own right and reconciles it against anything your message explicitly says (e.g. "just show me the diff, don't push yet" in your own message takes precedence). Set `standard_instructions` to a custom string on a mapping to replace the block entirely, or `false` to omit it.
+
+## Bypass syntax: keep a message with Hermes
+
+Prefix a message with `chat:` to keep that one message with Hermes instead of routing it to Claude Code:
+
+```
+@hermes chat: Help me think through the strategy before changing code.
+```
+
+The `chat:` prefix is stripped and the rest of the message goes to Hermes' normal agent loop, exactly as if auto-routing weren't configured for the channel at all. This is a per-message opt-out — every other message in the channel keeps auto-routing.
+
+## What still works normally
+
+- **Explicit slash commands** (`/status`, `/cc-delegate`, `/<skill-name>`, etc.) are never auto-routed — they dispatch exactly as they do everywhere else.
+- **`/cc-delegate`** still works in an auto-routed channel for one-off delegations to a *different* worker or workspace than the channel's default mapping.
+- **Bot messages** (including Hermes' own) are never auto-routed — no recursive delegation loop.
+- **Duplicate Discord events** are filtered the same way they always are (the gateway's existing message dedup), and a second delegation attempt for a worker that's still busy on the first gets a clear `busy` reply rather than a second Claude Code task.
+
+## Failure handling
+
+Auto-routing never silently falls back to substantial Hermes/OpenAI implementation work. Once a channel is configured and a message isn't a command or bypassed, the outcome is always reported back to the chat:
+
+- ✅ success — Claude's response, sanitised, same as `/cc-delegate`
+- ⏸️ approval required — Claude Code is waiting on an interactive approval prompt
+- 🔒 busy — the worker is already handling another prompt
+- 🔑 authentication failure — the worker needs to re-login
+- ❌ / 💀 the worker's tmux session is missing or dead
+- ⏱️ timeout, or ⚠️ a generic/extraction failure
+- ⚠️ a misconfigured mapping (e.g. an unregistered `worker`, or a `workspace` outside the worker's allowed root) — this is reported the same way, never silently widened or ignored
+
+The original request is never discarded on failure — retry it (or fix the `claude_routing` config, for a misconfiguration) and send it again.
+
+## Testing automatic routing
+
+1. Add a `claude_routing` entry for a test channel and restart the gateway.
+2. Send a plain message in that channel (no leading `/`): `@hermes say hello`.
+3. You should see an immediate **"🤖 Automatic routing activated"** acknowledgement naming the worker and workspace, followed by the worker's response (or a clear busy/approval/failure status) once it's ready.
+4. Confirm `/cc-delegate` and other slash commands still work normally in the same channel.
+5. Confirm `@hermes chat: ...` in that channel goes to Hermes instead.
+
+## Disabling it quickly
+
+Set `enabled: false` on the mapping (no need to delete it) and restart the gateway:
+
+```yaml
+claude_routing:
+  - platform: discord
+    channel_id: "123456789012345678"
+    enabled: false   # <-- messages in this channel go back to normal Hermes handling
+    worker: claude-momentum
+    workspace: /home/michael/code/momentum-studio
+    mode: claude_default
+```
+
+Or remove the `claude_routing` block (or the gateway config change) entirely and restart — with no entries, every channel behaves exactly as it did before this feature existed.

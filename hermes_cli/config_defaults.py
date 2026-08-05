@@ -2091,6 +2091,10 @@ DEFAULT_CONFIG = {
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only)
     "quick_commands": {},
+    # Configurable channel-to-Claude-Code-worker automatic routing. Each
+    # entry: {platform, channel_id, enabled, worker, workspace, mode,
+    # standard_instructions}. See agent/claude_code_auto_routing.py.
+    "claude_routing": [],
 
     # Per-platform system-prompt hint overrides. Lets an admin append to or
     # replace Hermes' built-in platform hint for a single messaging platform
