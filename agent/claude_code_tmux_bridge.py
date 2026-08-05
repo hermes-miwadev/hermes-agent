@@ -34,17 +34,25 @@ Notes
   done anything.
 * The response boundary is anchored on that same echoed prompt (found by
   content, since the marker is a fresh random value each call and cannot
-  coincidentally appear elsewhere) rather than a pre-send line count.
-  Claude Code's TUI repaints its whole viewport per frame and can settle to
-  a different total line count than the pre-send snapshot (e.g. a prior
-  turn's tool output collapsing once it's no longer active) -- a stale
-  count-based boundary can then land past the real response, producing a
-  detected-but-empty "success".
+  coincidentally appear elsewhere) rather than a pre-send line count. The
+  echo search tolerates the marker landing across a terminal soft-wrap
+  boundary -- a long real prompt is one collapsed logical line, and the
+  pane can wrap it across many physical rows, splitting the marker itself
+  so no single row contains it -- by searching the wrapped rows joined
+  back together (see ``_find_echo_line_idx``). Only when no echo can be
+  found at all does extraction fall back to the pre-send line count, and
+  even then only if that count still falls strictly before the marker
+  line: Claude Code's TUI repaints its whole viewport per frame and can
+  settle to a different total line count than the pre-send snapshot (e.g.
+  a prior turn's tool output collapsing once it's no longer active), and a
+  stale count past the marker line would otherwise produce a
+  guaranteed-empty, detected-but-empty "success".
 * No tmux session is created automatically; the session must already exist.
 """
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import enum
 import logging
@@ -329,6 +337,63 @@ def _clean_response_lines(lines: list[str]) -> str:
     return "\n".join(kept)
 
 
+def _find_echo_line_idx(
+    clean_lines: list[str], done_idx: int, done_marker: str
+) -> Optional[int]:
+    """Find the line index of the echoed, just-submitted prompt's
+    completion-marker instruction, searching clean_lines[:done_idx].
+
+    A real prompt is one long logical line (newlines are collapsed to
+    spaces before sending -- see _run_prompt), and Claude Code's terminal
+    UI soft-wraps it across as many physical pane rows as its length
+    requires. For a long prompt (the common case for real delegated
+    tasks, as opposed to short test fixtures) the wrap boundary can fall
+    *inside* the marker text itself, splitting it across two physical
+    rows so that no single row contains it as a contiguous substring --
+    a naive per-line scan then finds no echo at all, which is exactly the
+    reported "completion marker seen but no response extracted" bug:
+    with no echo found, extraction fell back to the pre-send line count,
+    which can be stale enough (e.g. earlier tool output in the same
+    session having since collapsed) to land at or past the marker line
+    and produce a guaranteed-empty slice.
+
+    Soft-wrap only breaks the character stream; it never inserts or drops
+    characters. So concatenating consecutive rows with no separator
+    reconstructs the original unwrapped text, and searching *that* for
+    done_marker -- then mapping the match back to whichever row its last
+    character landed on -- finds the echo regardless of where it happened
+    to wrap. (This does mean two logically-unrelated adjacent rows could
+    in principle be concatenated into a false match; the marker is a
+    32-hex-char random UUID suffix, so this is not a practical risk.)
+
+    Skips over a line that is *itself* an exact, standalone completion
+    marker (rather than treating it as the echo) the same way the
+    original per-line scan did -- an earlier duplicate "done" line is the
+    marker being echoed back as itself, not the prompt that asked for it.
+    """
+    search_lines = clean_lines[:done_idx]
+    if not search_lines:
+        return None
+
+    offsets: list[int] = []
+    pos = 0
+    for line in search_lines:
+        offsets.append(pos)
+        pos += len(line)
+    joined = "".join(search_lines)
+
+    search_end = len(joined)
+    while True:
+        match_start = joined.rfind(done_marker, 0, search_end)
+        if match_start == -1:
+            return None
+        match_end = match_start + len(done_marker) - 1
+        line_idx = bisect.bisect_right(offsets, match_end) - 1
+        if clean_lines[line_idx].strip() != done_marker:
+            return line_idx
+        search_end = match_start
+
+
 def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> Optional[str]:
     """Extract Claude's response immediately preceding the completion marker.
 
@@ -344,21 +409,27 @@ def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> O
     repeat it back -- causing a false "done" the moment the prompt is
     echoed, before Claude has produced any real output.
 
-    The start of the response is anchored on that same echoed-prompt line
-    (found by searching for the marker as a *substring*, since it is a
-    fresh random value per call and so cannot coincidentally appear
-    anywhere else in the pane) rather than *pre_line_count* alone. Claude
-    Code's TUI repaints its whole viewport per frame and can settle to a
-    different total line count than the pre-send snapshot (e.g. a prior
-    turn's tool output collapsing once no longer active) -- a stale
-    count-based boundary can then land past the real response, so the echo
-    search is *not* bounded by pre_line_count: the marker's uniqueness
-    already guarantees any line containing it (other than the exact-match
-    completion line) is this submission's own echo, not older history, so
-    finding it anywhere below the marker is a safe, authoritative boundary
-    in its own right. When no echo line is found at all (e.g. simple/
-    synthetic pane content with no embedded marker substring), *pre_line_count*
-    is used as a fallback floor instead.
+    The start of the response is anchored on that same echoed-prompt line,
+    found via _find_echo_line_idx -- which tolerates the marker being
+    split across a terminal soft-wrap boundary, see its docstring --
+    rather than *pre_line_count* alone. Claude Code's TUI repaints its
+    whole viewport per frame and can settle to a different total line
+    count than the pre-send snapshot (e.g. a prior turn's tool output
+    collapsing once no longer active) -- a stale count-based boundary can
+    then land at or past the marker line itself, producing a
+    guaranteed-empty (start >= stop) slice: a detected-but-empty "success"
+    for a turn that actually has real content.
+
+    When no echo line is found at all (e.g. Claude Code's TUI collapsed a
+    very long pasted prompt to a placeholder that never renders the
+    marker text anywhere, or simple/synthetic pane content with no
+    embedded marker substring), *pre_line_count* is used as a fallback
+    floor -- but only when it doesn't exceed the marker line itself
+    (pre_line_count == done_idx is a legitimate "nothing new was added"
+    case, not staleness). A pre_line_count *past* done_idx is provably
+    stale (no legitimate content can start after the marker that
+    terminates it), so it is discarded in favour of 0 (the start of the
+    captured pane) rather than guaranteeing an empty result.
     """
     clean_lines = _strip_ansi(post_raw).splitlines()
 
@@ -371,14 +442,12 @@ def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> O
     if done_idx is None:
         return None
 
-    echo_idx = None
-    for i in range(done_idx - 1, -1, -1):
-        line = clean_lines[i]
-        if done_marker in line and line.strip() != done_marker:
-            echo_idx = i
-            break
+    echo_idx = _find_echo_line_idx(clean_lines, done_idx, done_marker)
 
-    start_idx = echo_idx + 1 if echo_idx is not None else pre_line_count
+    if echo_idx is not None:
+        start_idx = echo_idx + 1
+    else:
+        start_idx = pre_line_count if pre_line_count <= done_idx else 0
 
     response = _clean_response_lines(clean_lines[start_idx:done_idx])
     return _redact_credentials(response)
