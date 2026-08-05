@@ -171,6 +171,10 @@ def build_request(worker_name: str, requested_path: Optional[str], prompt: str) 
 _STATUS_TEMPLATES: dict[BridgeStatus, str] = {
     BridgeStatus.TIMEOUT: "⏱️ `{worker}` timed out before responding: {error}",
     BridgeStatus.BUSY: "🔒 `{worker}` is already handling another prompt. Try again shortly.",
+    # The bridge's error text already names the session and, when safely
+    # extractable, a sanitised preview of what's pending -- shown verbatim,
+    # not automatically approved.
+    BridgeStatus.APPROVAL_REQUIRED: "⏸️ {error}",
     BridgeStatus.AUTH_FAILURE: "🔑 `{worker}` needs to re-authenticate (Claude Code login/OAuth).",
     BridgeStatus.SESSION_MISSING: "❌ `{worker}` has no running tmux session.",
     BridgeStatus.SESSION_DEAD: "💀 `{worker}` session exists but has no live pane.",

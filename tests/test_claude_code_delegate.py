@@ -244,6 +244,25 @@ class TestFormatResult:
         for snippet in expect_snippets:
             assert snippet in out
 
+    def test_approval_required_shows_bridge_error_verbatim(self):
+        # The bridge's own error text already names the session (and, when
+        # extractable, a sanitised preview) -- format_result must not
+        # editorialise or truncate it, just prefix it for operators.
+        result = BridgeResult(
+            status=BridgeStatus.APPROVAL_REQUIRED,
+            error="Claude Code requires approval in tmux session 'claude-momentum'. "
+                  "Pending: Bash command rm -rf /tmp/foo",
+        )
+        out = format_result("claude-momentum", result)
+        assert "claude-momentum" in out
+        assert "requires approval" in out
+        assert "Pending: Bash command rm -rf /tmp/foo" in out
+
+    def test_approval_required_never_reads_as_success(self):
+        result = BridgeResult(status=BridgeStatus.APPROVAL_REQUIRED, error="needs approval")
+        out = format_result("claude-momentum", result)
+        assert not out.startswith("✅")
+
     def test_failure_includes_error_detail(self):
         result = BridgeResult(status=BridgeStatus.FAILURE, error="tmux not found on PATH")
         out = format_result("claude-momentum", result)
