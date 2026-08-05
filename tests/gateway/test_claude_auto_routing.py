@@ -10,7 +10,7 @@ tests/gateway/test_discord_thread_reliability.py.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -930,3 +930,145 @@ class TestCcTasksCommand:
         event = _make_event("/cc-tasks not-a-number")
         result = await runner._handle_cc_tasks_command(event)
         assert "Usage:" in result
+
+
+# ---------------------------------------------------------------------------
+# Production regression: a live auto-routed task reportedly still timed out
+# at exactly the bridge's OLD 300s default ("Completion marker not seen
+# within 300s"), with an old-format ack (no task ID / no later-delivery
+# promise). Every test above proves the *argument-passing* is correct by
+# mocking submit_prompt() itself -- which cannot catch a regression in
+# submit_prompt/_run_prompt's own poll loop, only in what gets passed to it.
+# These two tests drive the REAL bridge (agent.claude_code_tmux_bridge),
+# mocking only the low-level tmux subprocess calls, through the REAL
+# auto-routing dispatch path -- so they fail if the effective timeout used
+# is ever the bridge's bare 300s default instead of the configured
+# background-worker timeout, and they fail if the ack is missing a task ID
+# or the "delivered later" framing.
+# ---------------------------------------------------------------------------
+
+
+class TestRealBridgePollLoopExceedsOldDefault:
+    @pytest.mark.asyncio
+    async def test_task_finishing_past_300s_succeeds_not_old_default_timeout(self, monkeypatch):
+        """Drives the REAL submit_prompt()/_run_prompt() poll loop (only
+        tmux subprocess calls mocked) through the real auto-routing dispatch
+        path, using a controlled fake clock. The completion marker appears
+        only after ~360 virtual seconds -- past the bridge's OLD 300s
+        default. If auto-routing ever regresses to not passing
+        background_timeout_seconds through (request.timeout ends up None,
+        eff_timeout falls back to the bridge's bare 300s default), the real
+        poll loop hits its deadline at 300s and this test fails with a
+        TIMEOUT result and "300s" in the delivered content -- exactly the
+        reported production symptom.
+        """
+        import agent.claude_code_tmux_bridge as bridge
+
+        run_id = "f" * 32
+        done_marker = f"HERMES_BRIDGE_DONE_{run_id}"
+
+        monkeypatch.setattr(bridge, "_session_exists", lambda s: True)
+        monkeypatch.setattr(bridge, "_pane_alive", lambda s: True)
+        monkeypatch.setattr(bridge, "_send_keys", lambda s, t: True)
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+
+        # Fake clock: submit_prompt/_run_prompt only ever call time.monotonic()
+        # and time.sleep() -- no real wall-clock waiting happens in this test.
+        clock = [0.0]
+        monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+
+        def _fake_sleep(seconds):
+            clock[0] += 60.0  # each poll "costs" 60 virtual seconds
+
+        monkeypatch.setattr(bridge.time, "sleep", _fake_sleep)
+
+        # First capture is the pre-send snapshot (empty pane). Then "still
+        # working" for several polls -- crossing the 300s mark -- before the
+        # completion marker finally appears at the 6th poll (~360s virtual).
+        call_count = [0]
+
+        def _fake_capture(session, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return ""
+            if call_count[0] < 7:
+                return "still working...\n"
+            return f"Finished after six minutes.\n{done_marker}\n"
+
+        monkeypatch.setattr(bridge, "_capture_pane", _fake_capture)
+
+        runner = _make_runner(config=_routing_config())  # default background_timeout_seconds (1800s)
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event(
+            "Wait six minutes without modifying any files. Then reply with "
+            "exactly: Finished after six minutes.",
+            message_id="msg-real-long-task",
+        )
+
+        ack = await runner._maybe_auto_route_to_claude(event, event.source)
+        # The ack itself proves the new format shipped: stable task ID and
+        # an explicit "posted later" promise, not the old bare ack.
+        assert "Task ID: `cc-" in ack
+        assert "post" in ack.lower()
+        # Nothing has been delivered yet -- the poll loop hasn't run.
+        mock_adapter.send.assert_not_called()
+
+        for task in list(runner._background_tasks):
+            await task
+
+        assert clock[0] > 300, (
+            "the real poll loop must genuinely advance past the bridge's old "
+            "300s default for this test to be a meaningful regression check"
+        )
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert "timed out" not in content.lower()
+        assert "300s" not in content
+        assert "Finished after six minutes." in content
+
+    @pytest.mark.asyncio
+    async def test_same_scenario_would_time_out_at_300s_under_the_old_bridge_default(self, monkeypatch):
+        """Companion/control test: proves the previous test's virtual-clock
+        scenario is genuinely sensitive to the timeout used -- calling the
+        real bridge directly with the bare 300s default (as auto-routing
+        would if it regressed to not passing a timeout) DOES time out
+        before the marker appears, confirming the two tests exercise the
+        exact reported failure mode and its fix."""
+        import agent.claude_code_tmux_bridge as bridge
+
+        bridge._session_locks.clear()
+        run_id = "e" * 32
+        done_marker = f"HERMES_BRIDGE_DONE_{run_id}"
+
+        monkeypatch.setattr(bridge, "_session_exists", lambda s: True)
+        monkeypatch.setattr(bridge, "_pane_alive", lambda s: True)
+        monkeypatch.setattr(bridge, "_send_keys", lambda s, t: True)
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+
+        clock = [0.0]
+        monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+
+        def _fake_sleep(seconds):
+            clock[0] += 60.0
+
+        monkeypatch.setattr(bridge.time, "sleep", _fake_sleep)
+
+        call_count = [0]
+
+        def _fake_capture(session, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return ""
+            if call_count[0] < 7:
+                return "still working...\n"
+            return f"Finished after six minutes.\n{done_marker}\n"
+
+        monkeypatch.setattr(bridge, "_capture_pane", _fake_capture)
+
+        # No timeout override -- falls back to claude-momentum's registered
+        # WorkerConfig.timeout (300.0), exactly like a regression that drops
+        # request.timeout back to None.
+        result = bridge.submit_prompt("claude-momentum", "wait six minutes")
+
+        assert result.status == BridgeStatus.TIMEOUT
+        assert "300s" in result.error
