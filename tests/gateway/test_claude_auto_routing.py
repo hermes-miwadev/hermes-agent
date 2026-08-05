@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from agent.claude_code_tmux_bridge import BridgeResult, BridgeStatus, _WORKERS
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
 
@@ -342,3 +342,138 @@ class TestDuplicateDelegationSuppression:
 
         content = mock_adapter.send.call_args.kwargs["content"]
         assert "already handling" in content
+
+
+# ---------------------------------------------------------------------------
+# Real GatewayConfig + RelayRuntime unavailability
+#
+# Every test above builds `runner.config` from a bare dict. That's exactly
+# how the bug shipped and went unnoticed: GatewayRunner.config in production
+# is a `gateway.config.GatewayConfig` dataclass instance built by
+# `load_gateway_config()`, not a dict, and (before the fix this module
+# accompanies) that dataclass had no `claude_routing` field at all --
+# `getattr(config, "claude_routing", None)` silently returned None no matter
+# what was in config.yaml, so `load_routing_mappings` always saw an empty
+# list and auto-routing could never fire for a real gateway. The bare-dict
+# mocks above couldn't catch that because a dict always has the key once
+# it's put there.
+#
+# The RelayRuntime/nemo_relay angle looked related only because of log
+# proximity: when auto-routing silently no-ops, the message falls through to
+# the normal Hermes/OpenAI agent loop, which is what actually triggers
+# agent.relay_runtime's lazy, per-profile RelayRuntime init (and its
+# graceful ModuleNotFoundError-to-NoopRelayRuntime fallback) on the next
+# turn. Nothing in the auto-routing decision/dispatch path
+# (gateway/claude_auto_routing.py, agent/claude_code_auto_routing.py,
+# agent/claude_code_delegate.py, agent/claude_code_tmux_bridge.py) imports
+# agent.relay_runtime or nemo_relay, so the tests below simulate nemo_relay
+# being fully unimportable and confirm that has zero effect on auto-routing.
+# ---------------------------------------------------------------------------
+
+
+def _real_config(**overrides) -> GatewayConfig:
+    """Build claude_routing through the actual production config type."""
+    entry = {
+        "platform": "discord",
+        "channel_id": CHANNEL_ID,
+        "enabled": True,
+        "worker": "claude-momentum",
+        "workspace": "/home/michael/code/momentum-studio",
+        "mode": "claude_default",
+    }
+    entry.update(overrides)
+    return GatewayConfig.from_dict({"claude_routing": [entry]})
+
+
+class TestAutoRoutingAgainstRealGatewayConfig:
+    @pytest.mark.asyncio
+    async def test_fires_against_a_real_gatewayconfig_instance(self):
+        """Regression for the actual root cause: GatewayRunner.config is a
+        GatewayConfig dataclass in production, not a dict. Auto-routing must
+        activate when the mapping comes from GatewayConfig.from_dict() (what
+        load_gateway_config() produces), not just from a hand-built dict."""
+        runner = _make_runner(config=_real_config())
+        event = _make_event("Say exactly: automatic routing test successful")
+
+        with patch(
+            "gateway.run.GatewayRunner._run_cc_delegate_task", new_callable=AsyncMock
+        ) as mock_run:
+            result = await runner._maybe_auto_route_to_claude(event, event.source)
+
+        assert result is not None
+        assert "Automatic routing activated" in result
+        assert len(runner._background_tasks) == 1
+        for task in list(runner._background_tasks):
+            await task
+        mock_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_disabled_mapping_via_real_config_returns_none(self):
+        runner = _make_runner(config=_real_config(enabled=False))
+        event = _make_event("Ship the pricing page.")
+        result = await runner._maybe_auto_route_to_claude(event, event.source)
+        assert result is None
+        assert not runner._background_tasks
+
+
+class TestAutoRoutingWithoutNemoRelay:
+    """Automatic Claude Code routing must not depend on RelayRuntime/nemo_relay."""
+
+    @pytest.fixture(autouse=True)
+    def _nemo_relay_unavailable(self):
+        from agent import relay_runtime
+
+        relay_runtime._reset_for_tests()
+
+        def _raise_module_not_found(*_args, **_kwargs):
+            raise ModuleNotFoundError("No module named 'nemo_relay'")
+
+        with patch.object(
+            relay_runtime, "_load_nemo_relay", side_effect=_raise_module_not_found
+        ):
+            yield
+        relay_runtime._reset_for_tests()
+
+    @pytest.mark.asyncio
+    async def test_auto_routing_fires_when_nemo_relay_import_fails(self):
+        from agent import relay_runtime
+
+        runner = _make_runner(config=_real_config())
+        event = _make_event("Say exactly: automatic routing test successful")
+
+        with patch(
+            "gateway.run.GatewayRunner._run_cc_delegate_task", new_callable=AsyncMock
+        ) as mock_run:
+            result = await runner._maybe_auto_route_to_claude(event, event.source)
+
+        assert result is not None
+        assert "Automatic routing activated" in result
+        for task in list(runner._background_tasks):
+            await task
+        mock_run.assert_awaited_once()
+
+        # Confirm the simulated unavailability was real (not silently
+        # skipped): RelayRuntime construction actually failed and the
+        # registry fell back to NoopRelayRuntime, exactly as production logs
+        # show ("Hermes Relay runtime initialization failed").
+        assert relay_runtime.get_runtime(create=True) is None
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_delegation_result_delivered_without_nemo_relay(self):
+        """Not just the routing decision -- the full dispatch through the
+        real _run_cc_delegate_task/tmux bridge machinery must also complete
+        and deliver a result when nemo_relay cannot be imported."""
+        runner = _make_runner(config=_real_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        mock_adapter.send.assert_called_once()
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert "Shipped it." in content

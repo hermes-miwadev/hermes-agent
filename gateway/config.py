@@ -955,6 +955,14 @@ class GatewayConfig:
     # dict with: name, platform, profile, and optional guild_id/chat_id/thread_id.
     profile_routes: list = field(default_factory=list)
 
+    # Configurable automatic Claude Code routing (Discord channels handed
+    # straight to a Claude Code tmux worker instead of the Hermes/OpenAI
+    # agent loop). Raw dicts -- validated lazily, per-entry, by
+    # agent.claude_code_auto_routing.load_routing_mappings() so a single bad
+    # entry never breaks dispatch for every message. See
+    # gateway/claude_auto_routing.py for the runtime call site.
+    claude_routing: list = field(default_factory=list)
+
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(
             self.systemd_watchdog_seconds
@@ -1079,6 +1087,7 @@ class GatewayConfig:
                 asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
                 for r in self.profile_routes
             ],
+            "claude_routing": self.claude_routing,
         }
     
     @classmethod
@@ -1189,6 +1198,10 @@ class GatewayConfig:
         from gateway.profile_routing import parse_profile_routes
         profile_routes = parse_profile_routes(data.get("profile_routes") or [])
 
+        claude_routing = data.get("claude_routing", [])
+        if not isinstance(claude_routing, list):
+            claude_routing = []
+
         return cls(
             platforms=platforms,
             default_reset_policy=default_policy,
@@ -1214,6 +1227,7 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,
+            claude_routing=claude_routing,
         )
 
     def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
@@ -1358,6 +1372,22 @@ def load_gateway_config() -> GatewayConfig:
                 _pr = gateway_section.get("profile_routes")
             if isinstance(_pr, list):
                 gw_data["profile_routes"] = _pr
+
+            # Configurable automatic Claude Code routing (claude_routing):
+            # accept either top-level ``claude_routing`` or the nested
+            # ``gateway.claude_routing`` form (same precedence contract as
+            # profile_routes above). Without this, `claude_routing` is
+            # recognised by the `hermes config` schema
+            # (_OPEN_DICT_TOP_LEVEL_KEYS) but never reaches the runtime
+            # GatewayConfig object GatewayRunner.config actually holds --
+            # agent.claude_code_auto_routing.load_routing_mappings() does its
+            # own per-entry validation, so this loader just needs to carry the
+            # raw list through.
+            _cr = yaml_cfg.get("claude_routing")
+            if _cr is None and isinstance(gateway_section, dict):
+                _cr = gateway_section.get("claude_routing")
+            if isinstance(_cr, list):
+                gw_data["claude_routing"] = _cr
 
             if isinstance(gateway_section, dict):
                 if "multiplex_profiles" in gateway_section and "multiplex_profiles" not in gw_data:
