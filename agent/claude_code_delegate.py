@@ -175,6 +175,7 @@ _STATUS_TEMPLATES: dict[BridgeStatus, str] = {
     # extractable, a sanitised preview of what's pending -- shown verbatim,
     # not automatically approved.
     BridgeStatus.APPROVAL_REQUIRED: "⏸️ {error}",
+    BridgeStatus.EXTRACTION_FAILURE: "⚠️ {error}",
     BridgeStatus.AUTH_FAILURE: "🔑 `{worker}` needs to re-authenticate (Claude Code login/OAuth).",
     BridgeStatus.SESSION_MISSING: "❌ `{worker}` has no running tmux session.",
     BridgeStatus.SESSION_DEAD: "💀 `{worker}` session exists but has no live pane.",
