@@ -276,6 +276,26 @@ class TestGatewayConfigRoundtrip:
 
         assert config.get_unauthorized_dm_behavior(Platform.EMAIL) == "pair"
 
+    def test_claude_routing_from_dict_defaults_to_empty_list(self):
+        assert GatewayConfig.from_dict({}).claude_routing == []
+
+    def test_claude_routing_from_dict_ignores_non_list_values(self):
+        config = GatewayConfig.from_dict({"claude_routing": "not-a-list"})
+        assert config.claude_routing == []
+
+    def test_claude_routing_roundtrip(self):
+        entry = {
+            "platform": "discord",
+            "channel_id": "111222333444555666",
+            "worker": "claude-momentum",
+            "workspace": "/home/michael/code/momentum-studio",
+        }
+        config = GatewayConfig.from_dict({"claude_routing": [entry]})
+
+        assert config.claude_routing == [entry]
+        restored = GatewayConfig.from_dict(config.to_dict())
+        assert restored.claude_routing == [entry]
+
 
 class TestLoadGatewayConfig:
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
@@ -453,6 +473,75 @@ class TestLoadGatewayConfig:
         config = load_gateway_config()
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
+
+    def test_claude_routing_from_top_level_config(self, tmp_path, monkeypatch):
+        """``claude_routing`` (Phase 3 automatic Claude Code routing) must
+        reach the runtime GatewayConfig object GatewayRunner.config actually
+        holds.
+
+        Regression: claude_routing was registered in the `hermes config`
+        schema (hermes_cli/config.py's _OPEN_DICT_TOP_LEVEL_KEYS) and on the
+        GatewayConfig dataclass, but load_gateway_config() never copied the
+        YAML key into gw_data before calling GatewayConfig.from_dict() --
+        so a correctly-configured claude_routing entry in config.yaml
+        silently never reached the gateway, and
+        agent.claude_code_auto_routing.load_routing_mappings() always saw an
+        empty list via getattr(config, "claude_routing", None). Every
+        ordinary message in the configured channel then fell through to the
+        normal Hermes/OpenAI agent loop instead of being auto-routed, with
+        no error surfaced anywhere.
+        """
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "claude_routing:\n"
+            "  - platform: discord\n"
+            "    channel_id: \"111222333444555666\"\n"
+            "    worker: claude-momentum\n"
+            "    workspace: /home/michael/code/momentum-studio\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.claude_routing == [
+            {
+                "platform": "discord",
+                "channel_id": "111222333444555666",
+                "worker": "claude-momentum",
+                "workspace": "/home/michael/code/momentum-studio",
+            }
+        ]
+
+    def test_claude_routing_from_nested_gateway_section(self, tmp_path, monkeypatch):
+        """``gateway.claude_routing`` (nested form) must also reach
+        GatewayConfig, mirroring the gateway.quick_commands precedent."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "gateway:\n"
+            "  claude_routing:\n"
+            "    - platform: discord\n"
+            "      channel_id: \"111222333444555666\"\n"
+            "      worker: claude-momentum\n"
+            "      workspace: /home/michael/code/momentum-studio\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.claude_routing == [
+            {
+                "platform": "discord",
+                "channel_id": "111222333444555666",
+                "worker": "claude-momentum",
+                "workspace": "/home/michael/code/momentum-studio",
+            }
+        ]
 
     def test_stt_from_nested_gateway_section(self, tmp_path, monkeypatch):
         """Asserts False (not the True default) so the test fails if the

@@ -209,3 +209,159 @@ class TestRunCcDelegateTask:
             await runner._run_cc_delegate_task(request, self._source())
 
         mock_submit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: optional task_id/message_ref -- delivery ledger + task registry
+# wiring. Plain /cc-delegate never passes these (both stay None), which
+# must leave its behaviour byte-for-byte identical to every test above.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _isolated_state_db(tmp_path, monkeypatch):
+    import gateway.claude_task_registry as task_registry
+    import gateway.delivery_ledger as delivery_ledger
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(task_registry, "_db_path", lambda: home / "state.db")
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: home / "state.db")
+
+
+class TestRunCcDelegateTaskWithTaskIdAndLedger:
+    def _source(self):
+        return SessionSource(
+            platform=Platform.DISCORD,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_cc_delegate_call_creates_no_registry_row(self, _isolated_state_db):
+        """No task_id passed (the real /cc-delegate call site never passes
+        one) -- no row should exist in the task registry afterwards."""
+        from agent.claude_code_delegate import build_request
+        from gateway.claude_task_registry import list_recent_tasks
+
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        request = build_request("claude-momentum", None, "say hi")
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="hello there")
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._run_cc_delegate_task(request, self._source())
+
+        assert list_recent_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_task_id_marks_finished_and_delivered_on_success(self, _isolated_state_db):
+        from agent.claude_code_delegate import build_request
+        from gateway.claude_task_registry import (
+            DELIVERY_DELIVERED,
+            EXECUTION_FINISHED,
+            find_task,
+            record_task_started,
+        )
+
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        request = build_request("claude-momentum", None, "say hi")
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="hello there")
+
+        record_task_started(
+            "cc-phase4-test", session_key="discord:1:67890", platform="discord",
+            chat_id="67890", thread_id=None, worker="claude-momentum",
+            workspace="/home/michael/code", prompt_preview="say hi",
+        )
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._run_cc_delegate_task(
+                request, self._source(),
+                task_id="cc-phase4-test", message_ref="discord-msg-1",
+            )
+
+        row = find_task("cc-phase4-test")
+        assert row["execution_state"] == EXECUTION_FINISHED
+        assert row["bridge_status"] == "success"
+        assert row["delivery_state"] == DELIVERY_DELIVERED
+
+    @pytest.mark.asyncio
+    async def test_task_id_marks_delivery_failed_when_send_raises(self, _isolated_state_db):
+        from agent.claude_code_delegate import build_request
+        from gateway.claude_task_registry import DELIVERY_FAILED, find_task, record_task_started
+
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send.side_effect = RuntimeError("discord unavailable")
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        request = build_request("claude-momentum", None, "say hi")
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="hello there")
+
+        record_task_started(
+            "cc-phase4-fail", session_key="discord:1:67890", platform="discord",
+            chat_id="67890", thread_id=None, worker="claude-momentum",
+            workspace="/home/michael/code", prompt_preview="say hi",
+        )
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._run_cc_delegate_task(
+                request, self._source(),
+                task_id="cc-phase4-fail", message_ref="discord-msg-2",
+            )
+
+        row = find_task("cc-phase4-fail")
+        assert row["delivery_state"] == DELIVERY_FAILED
+        assert "discord unavailable" in row["delivery_error"]
+
+    @pytest.mark.asyncio
+    async def test_message_ref_records_and_marks_obligation_delivered(self, _isolated_state_db):
+        from agent.claude_code_delegate import build_request
+        from gateway.delivery_ledger import _connect
+
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        request = build_request("claude-momentum", None, "say hi")
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="hello there")
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._run_cc_delegate_task(
+                request, self._source(), message_ref="discord-msg-3",
+            )
+
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT state, content FROM delivery_obligations WHERE chat_id=?",
+                ("67890",),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "delivered"
+        assert "hello there" in row[1]
+
+    @pytest.mark.asyncio
+    async def test_missing_adapter_with_task_id_marks_delivery_failed(self, _isolated_state_db):
+        from agent.claude_code_delegate import build_request
+        from gateway.claude_task_registry import DELIVERY_FAILED, find_task, record_task_started
+
+        runner = _make_runner()  # no adapters registered
+        request = build_request("claude-momentum", None, "say hi")
+
+        record_task_started(
+            "cc-phase4-no-adapter", session_key="discord:1:67890", platform="discord",
+            chat_id="67890", thread_id=None, worker="claude-momentum",
+            workspace="/home/michael/code", prompt_preview="say hi",
+        )
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt") as mock_submit:
+            await runner._run_cc_delegate_task(
+                request, self._source(),
+                task_id="cc-phase4-no-adapter", message_ref="discord-msg-4",
+            )
+
+        mock_submit.assert_not_called()
+        row = find_task("cc-phase4-no-adapter")
+        assert row["delivery_state"] == DELIVERY_FAILED

@@ -149,6 +149,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Delegate a task to an allowlisted, authenticated Claude Code tmux worker",
                "Session", gateway_only=True, aliases=("cc_delegate",),
                args_hint="<worker> [--path <dir>] <prompt>"),
+    CommandDef("cc-tasks",
+               "Show recent auto-routed Claude Code tasks (task ID, worker, workspace, "
+               "execution/delivery state)",
+               "Session", gateway_only=True, aliases=("cc_tasks",),
+               args_hint="[limit]"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1268,7 +1273,12 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - cc-delegate: deliberate, low-frequency operator delegation to a Claude
 #     Code tmux worker; reached via /hermes cc-delegate on Slack so it
 #     doesn't tip the registry past the 50-cap and clamp another command off.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "cc-delegate"})
+#   - cc-tasks: low-frequency read-only status query for auto-routed Claude
+#     Code tasks; reached via /hermes cc-tasks on Slack for the same reason.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "cc-delegate", "cc-tasks",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

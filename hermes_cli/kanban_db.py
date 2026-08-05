@@ -92,6 +92,8 @@ from typing import Any, Iterable, Mapping, Optional
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+logger = logging.getLogger(__name__)
+
 _log = logging.getLogger(__name__)
 
 
@@ -6485,6 +6487,24 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _ensure_worktree_git_identity(repo_root: Path, target: Path) -> None:
+    """Best-effort: give *target* a repo-local Git author identity if it
+    doesn't already have one (usually a no-op -- a linked worktree shares
+    repo_root's config automatically). Never raises: an autonomous kanban
+    worker with no one watching must not get stuck on this; a missing
+    identity is logged instead so it's visible without blocking dispatch.
+    See hermes_cli/git_identity.py for the inheritance precedence.
+    """
+    try:
+        from hermes_cli.git_identity import ensure_workspace_identity
+
+        result = ensure_workspace_identity(target, source_repo=repo_root)
+        if not result.applied:
+            logger.warning("kanban worktree %s: %s", target, result.message)
+    except Exception:
+        logger.debug("kanban worktree %s: git-identity inheritance failed", target, exc_info=True)
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -6492,6 +6512,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            _ensure_worktree_git_identity(repo_root, target)
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -6513,6 +6534,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
         )
+    _ensure_worktree_git_identity(repo_root, target)
 
 
 def _resolve_worktree_workspace(

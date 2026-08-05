@@ -18,6 +18,7 @@ from agent.claude_code_tmux_bridge import (
     _clean_response_lines,
     _extract_approval_preview,
     _extract_response,
+    _find_echo_line_idx,
     _is_approval_required,
     _is_auth_failure,
     _is_chrome_line,
@@ -394,6 +395,261 @@ class TestRealisticResponseExtraction:
         assert "\x1b" not in result
         assert "\r" not in result
         assert "Current branch: feat/virtual-services-astro-migration." in result
+
+
+# ── Regression: marker split across a terminal soft-wrap boundary ───────────
+#
+# Reported bug: a real, long delegated task (the Momentum Studio rebrand)
+# completed successfully -- committed, pushed, opened a PR, and emitted the
+# completion marker alone on its own line, exactly as instructed -- but
+# Discord received "no response text could be extracted from the pane."
+#
+# Root cause: a real prompt is one long collapsed logical line (newlines are
+# joined to spaces before sending), and Claude Code's terminal UI soft-wraps
+# it across as many physical pane rows as it needs. The old per-line echo
+# search only ever checked one physical row at a time for the marker
+# substring; for a long enough prompt the wrap boundary can fall *inside*
+# the marker text itself, splitting it across two rows so no single row
+# contains it -- the echo search then found nothing, and extraction fell
+# back to the pre-send line count. That fallback is a snapshot from *before*
+# the prompt was even sent; for a long-running session with a lot of prior
+# tool output that later collapsed/settled to a shorter pane, it can be
+# stale enough to land at or past the marker line, producing a
+# `clean_lines[start_idx:done_idx]` slice with start_idx >= done_idx --
+# i.e. always empty, regardless of how much real content precedes it.
+
+def _split_marker(done_marker: str, *, keep_on_first_line: int):
+    """Split *done_marker* into two fragments at an arbitrary interior
+    offset, modelling a terminal hard-wrapping a long echoed line right in
+    the middle of the marker token itself."""
+    assert 0 < keep_on_first_line < len(done_marker)
+    return done_marker[:keep_on_first_line], done_marker[keep_on_first_line:]
+
+
+def _wrapped_prompt_real_world_transcript(done_marker: str, *, split_at: int = 40) -> str:
+    """Build a post-pane transcript modelling the exact real-world shape
+    that triggered the reported bug: a long, single-logical-line prompt
+    (collapsed from a multi-paragraph task spec, as _run_prompt actually
+    sends it) whose terminal echo wraps across several physical rows --
+    landing the wrap boundary inside the completion-marker text itself --
+    followed by several interleaved tool calls and a substantial
+    multi-section markdown final report, ending with the marker alone on
+    its own line.
+    """
+    first_frag, second_frag = _split_marker(done_marker, keep_on_first_line=split_at)
+    echo_lines = [
+        "> (Work only within /home/michael/code/momentum-studio.) Task: Momentum Studio",
+        "rebrand: text-only copy update. Inspect the repository and replace every",
+        "user-facing textual reference to Virtual Services with Momentum Studio wherever",
+        "it is clearly referring to the business or brand. (When your response is",
+        f"complete, output exactly on its own line: {first_frag}",
+        f"{second_frag})",
+    ]
+    report = "\n".join([
+        "## Momentum Studio rebrand complete",
+        "",
+        "**Branch:** `feat/momentum-studio-rebrand`",
+        "**Commit:** `b09ce6a`",
+        "**PR:** https://github.com/momentumstudio-nz/momentum-studio/pull/9",
+        "",
+        "### Files changed (34)",
+        "- `src/generated/heads/*.html` (13 files)",
+        "- `src/generated/bodies/*.html` (17 files)",
+        "- `src/pages/404.astro`",
+        "",
+        "### Checks run",
+        "- `npm test` -- 17/17 passing",
+        "- `npm run build` -- 20 pages built",
+        "- `npm run check:webflow-independence` -- clean",
+        "- `git diff --check` -- clean",
+        "",
+        "No unrelated changes were included.",
+    ])
+    return "\n".join([
+        "old prior turn history that has since collapsed",
+        "",
+        *echo_lines,
+        "",
+        "⏺ Bash(npm test)",
+        "  ⎿  17 passed",
+        "",
+        "⏺ Bash(git push origin feat/momentum-studio-rebrand)",
+        "  ⎿  branch pushed",
+        "",
+        "⏺ Bash(gh pr create ...)",
+        "  ⎿  https://github.com/momentumstudio-nz/momentum-studio/pull/9",
+        "",
+        report,
+        "",
+        done_marker,
+    ])
+
+
+class TestFindEchoLineIdx:
+    def test_marker_split_across_two_lines_is_still_found(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        first, second = _split_marker(done, keep_on_first_line=40)
+        lines = ["prior", f"prefix {first}", f"{second} suffix", done]
+        # done_idx = 3 (the standalone marker line); search only lines[:3]
+        idx = _find_echo_line_idx(lines, done_idx=3, done_marker=done)
+        assert idx == 2  # the row where the marker's *last* character lands
+
+    def test_marker_split_across_three_lines_is_still_found(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        # A very narrow wrap width splitting the marker into three chunks.
+        a, b, c = done[:10], done[10:30], done[30:]
+        lines = ["prior", f"pfx {a}", b, f"{c} sfx", done]
+        idx = _find_echo_line_idx(lines, done_idx=4, done_marker=done)
+        assert idx == 3
+
+    def test_marker_fully_on_one_line_matches_prior_behaviour(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        lines = ["prior", f"echo of prompt with {done} embedded", done]
+        idx = _find_echo_line_idx(lines, done_idx=2, done_marker=done)
+        assert idx == 1
+
+    def test_no_echo_anywhere_returns_none(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        lines = ["prior", "unrelated line", done]
+        assert _find_echo_line_idx(lines, done_idx=2, done_marker=done) is None
+
+    def test_skips_earlier_standalone_marker_line_and_keeps_searching(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        lines = [
+            "prior",
+            done,  # an earlier duplicate "done" line -- not a real echo
+            f"> do it (output exactly on its own line: {done})",
+            "The answer.",
+            done,
+        ]
+        idx = _find_echo_line_idx(lines, done_idx=4, done_marker=done)
+        assert idx == 2
+
+
+class TestWrappedMarkerRealWorldRegression:
+    """Reproduces the exact reported bug: a long real prompt whose terminal
+    echo wraps the completion marker across a line boundary, plus several
+    tool calls and a full multi-section markdown report -- all of which
+    the old fallback-to-pre_line_count logic reduced to an empty string."""
+
+    def test_stale_pre_line_count_no_longer_produces_empty_response(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        post_pane = _wrapped_prompt_real_world_transcript(done)
+        # A large stale pre-send snapshot -- modelling a long-running
+        # session whose earlier tool output later collapsed, shrinking the
+        # settled pane well below what it was when the prompt was sent.
+        stale_pre_line_count = 400
+
+        result = _extract_response(stale_pre_line_count, post_pane, done)
+
+        assert result is not None
+        assert result != ""
+
+    def test_full_markdown_report_extracted_intact(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        post_pane = _wrapped_prompt_real_world_transcript(done)
+
+        result = _extract_response(400, post_pane, done)
+
+        assert result is not None
+        for expected in (
+            "## Momentum Studio rebrand complete",
+            "**Branch:** `feat/momentum-studio-rebrand`",
+            "**PR:** https://github.com/momentumstudio-nz/momentum-studio/pull/9",
+            "### Files changed (34)",
+            "- `src/generated/heads/*.html` (13 files)",
+            "### Checks run",
+            "- `npm test` -- 17/17 passing",
+            "No unrelated changes were included.",
+        ):
+            assert expected in result, f"missing from extracted response: {expected!r}"
+
+    def test_tool_calls_and_echoed_prompt_still_excluded(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        post_pane = _wrapped_prompt_real_world_transcript(done)
+
+        result = _extract_response(400, post_pane, done)
+
+        assert result is not None
+        assert "⏺" not in result
+        assert "⎿" not in result
+        assert "npm test)" not in result  # the tool-call bullet, not the report line
+        assert "output exactly on its own line" not in result
+        assert "Inspect the repository and replace" not in result
+        assert done not in result
+
+    def test_works_regardless_of_where_the_marker_happens_to_split(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        for split_at in (1, 5, 25, len(done) - 1):
+            post_pane = _wrapped_prompt_real_world_transcript(done, split_at=split_at)
+            result = _extract_response(400, post_pane, done)
+            assert result is not None and result != "", f"failed for split_at={split_at}"
+            assert "## Momentum Studio rebrand complete" in result
+
+    def test_end_to_end_via_submit_prompt_reports_success_not_extraction_failure(
+        self, monkeypatch
+    ):
+        run_id = FAKE_RUN_ID
+        done = f"HERMES_BRIDGE_DONE_{run_id}"
+        post_pane = _wrapped_prompt_real_world_transcript(done)
+        # A stale, oversized pre-send snapshot -- the exact condition that
+        # reduced the real task's report to an empty extracted response.
+        pre_pane = "\n".join(f"old line {i}" for i in range(400)) + "\n"
+
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+        _setup_session(monkeypatch)
+        _setup_io(monkeypatch, pre_pane=pre_pane, post_pane=post_pane)
+        monkeypatch.setattr(bridge.time, "sleep", lambda x: None)
+
+        result = bridge.submit_prompt(
+            "claude-momentum", "Momentum Studio rebrand task", timeout=10.0
+        )
+
+        assert result.status == BridgeStatus.SUCCESS
+        assert result.status != BridgeStatus.EXTRACTION_FAILURE
+        assert "## Momentum Studio rebrand complete" in result.response
+
+
+class TestStalePreLineCountFallbackSafety:
+    """When no echo can be found at all (e.g. Claude Code's TUI collapses a
+    very long pasted prompt to a placeholder that never renders the marker
+    text anywhere), the pre_line_count fallback must never be trusted past
+    the marker line itself -- doing so guarantees an inverted, empty slice
+    regardless of how much real content precedes the marker."""
+
+    def test_pre_line_count_past_marker_falls_back_to_start_of_pane(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        # No echo anywhere -- models a collapsed/placeholder prompt display.
+        pane = "\n".join([
+            "[Pasted text +42 lines]",
+            "",
+            "⏺ Bash(npm test)",
+            "  ⎿  17 passed",
+            "",
+            "All checks passed.",
+            "",
+            done,
+        ])
+        done_idx = pane.splitlines().index(done)
+
+        result = _extract_response(pre_line_count=999, post_raw=pane, done_marker=done)
+
+        assert result is not None
+        assert "All checks passed." in result
+
+    def test_pre_line_count_exactly_at_marker_line_is_not_treated_as_stale(self):
+        """pre_line_count == done_idx means zero new lines were added --
+        a legitimate empty response, not an overshoot to guard against."""
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = f"pre\n{done}"
+        result = _extract_response(pre_line_count=1, post_raw=pane, done_marker=done)
+        assert result == ""
+
+    def test_pre_line_count_within_bounds_is_used_normally(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = "\n".join(["old 1", "old 2", "The real answer.", done])
+        result = _extract_response(pre_line_count=2, post_raw=pane, done_marker=done)
+        assert result == "The real answer."
 
 
 class TestExtractionFailureIntegration:
