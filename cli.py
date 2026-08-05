@@ -1689,6 +1689,25 @@ def _setup_worktree(repo_root: str = None, sync_base: bool = True) -> Optional[D
         print(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
         return None
 
+    # Ensure the new worktree can commit without an interactive git-identity
+    # prompt. A linked worktree normally already has one (repo-local config
+    # is shared with repo_root), so this is a no-op in the common case;
+    # otherwise it inherits one via hermes_cli.git_identity's precedence
+    # (source repo's own local identity -> this process's effective
+    # identity -> an operator-configured coding_workspace_identity
+    # fallback) and writes it repo-locally to the worktree only. Never
+    # touches --global config, never invents a value, never blocks worktree
+    # creation itself -- a missing identity is surfaced now (so it's not a
+    # surprise at the first commit), not silently discovered later.
+    try:
+        from hermes_cli.git_identity import ensure_workspace_identity
+
+        identity_result = ensure_workspace_identity(wt_path, source_repo=Path(repo_root))
+        if not identity_result.applied:
+            print(f"\033[33m⚠ {identity_result.message}\033[0m")
+    except Exception as e:
+        logger.debug("worktree git-identity inheritance failed (non-fatal): %s", e)
+
     # Copy files listed in .worktreeinclude (gitignored files the agent needs)
     include_file = Path(repo_root) / ".worktreeinclude"
     if include_file.exists():

@@ -2095,6 +2095,12 @@ DEFAULT_CONFIG = {
     # entry: {platform, channel_id, enabled, worker, workspace, mode,
     # standard_instructions}. See agent/claude_code_auto_routing.py.
     "claude_routing": [],
+    # Last-resort Git author identity for newly created Hermes-managed
+    # coding workspaces (fresh clones/worktrees) when no existing identity
+    # can be inherited from the source repo or the current process's own
+    # git config. Both name and email must be set for this to be used --
+    # never invented or auto-derived. See hermes_cli/git_identity.py.
+    "coding_workspace_identity": {},
 
     # Per-platform system-prompt hint overrides. Lets an admin append to or
     # replace Hermes' built-in platform hint for a single messaging platform
