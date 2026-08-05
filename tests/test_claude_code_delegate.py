@@ -263,6 +263,21 @@ class TestFormatResult:
         out = format_result("claude-momentum", result)
         assert not out.startswith("✅")
 
+    def test_extraction_failure_shows_bridge_error_verbatim(self):
+        result = BridgeResult(
+            status=BridgeStatus.EXTRACTION_FAILURE,
+            error="Claude Code finished in tmux session 'claude-momentum', but no "
+                  "response text could be extracted from the pane.",
+        )
+        out = format_result("claude-momentum", result)
+        assert "claude-momentum" in out
+        assert "no response text could be extracted" in out
+
+    def test_extraction_failure_never_reads_as_success(self):
+        result = BridgeResult(status=BridgeStatus.EXTRACTION_FAILURE, error="nothing extracted")
+        out = format_result("claude-momentum", result)
+        assert not out.startswith("✅")
+
     def test_failure_includes_error_detail(self):
         result = BridgeResult(status=BridgeStatus.FAILURE, error="tmux not found on PATH")
         out = format_result("claude-momentum", result)

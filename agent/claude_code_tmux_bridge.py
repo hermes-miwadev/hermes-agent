@@ -32,6 +32,14 @@ Notes
   prompt (which necessarily contains the marker text, since we asked Claude
   to repeat it back), producing a false empty "success" before Claude has
   done anything.
+* The response boundary is anchored on that same echoed prompt (found by
+  content, since the marker is a fresh random value each call and cannot
+  coincidentally appear elsewhere) rather than a pre-send line count.
+  Claude Code's TUI repaints its whole viewport per frame and can settle to
+  a different total line count than the pre-send snapshot (e.g. a prior
+  turn's tool output collapsing once it's no longer active) -- a stale
+  count-based boundary can then land past the real response, producing a
+  detected-but-empty "success".
 * No tmux session is created automatically; the session must already exist.
 """
 
@@ -98,6 +106,30 @@ _LEADING_MARKER_RE = re.compile(r"^[\s❯>*\-]+")
 
 _APPROVAL_PREVIEW_MAX_CHARS = 160
 
+# ── Response-extraction chrome filters ────────────────────────────────────────
+#
+# Claude Code's CLI renders each turn as: echoed prompt -> zero or more tool
+# calls ("⏺ Bash(...)" / "⎿ <result>") -> the model's final prose -> our
+# completion marker. Only the final prose is "the response"; tool-call lines
+# and the persistent status footer are UI chrome that must not leak into it.
+
+# Tool-invocation and tool-result bullets ("⏺ Bash(git status)", "⎿  (25 lines)").
+_TOOL_CALL_PREFIX_RE = re.compile(r"^\s*[⏺⎿]")
+# The "thinking"/working spinner glyph Claude Code prefixes its status line
+# with while a turn is in progress (frames vary; the glyph itself doesn't).
+_SPINNER_PREFIX_RE = re.compile(r"^\s*[✻✽✢✶∴⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]")
+# The persistent bottom status/recap line(s): token/cost/context recap and
+# the "esc to interrupt" hint shown while a tool call or turn is running.
+_STATUS_FOOTER_RE = re.compile(
+    r"esc\s+to\s+interrupt"
+    r"|[·•]\s*\d+(?:\.\d+)?s\b"
+    r"|\btokens?\b\s*[·•]"
+    r"|\bcontext\s+(?:left|used|remaining)\b"
+    r"|\btotal\s+cost\b"
+    r"|\d+\s+tool\s+uses?\b",
+    re.IGNORECASE,
+)
+
 
 # ── Public types ──────────────────────────────────────────────────────────────
 
@@ -106,6 +138,7 @@ class BridgeStatus(enum.Enum):
     TIMEOUT = "timeout"
     BUSY = "busy"
     APPROVAL_REQUIRED = "approval_required"
+    EXTRACTION_FAILURE = "extraction_failure"
     AUTH_FAILURE = "auth_failure"
     SESSION_MISSING = "session_missing"
     SESSION_DEAD = "session_dead"
@@ -259,18 +292,73 @@ def _extract_approval_preview(new_content: str) -> Optional[str]:
     return preview
 
 
-def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> Optional[str]:
-    """Extract response lines from pane content captured after sending.
+def _is_chrome_line(line: str) -> bool:
+    """True if *line* is Claude Code UI chrome, not response content.
 
-    Returns lines from *pre_line_count* up to (not including) the done
-    marker line, sanitised; or None if the marker is absent.
+    Covers tool-call bullets, the working spinner, and the persistent
+    status footer (tokens/cost/context/"esc to interrupt"). Blank lines are
+    handled separately by the caller so interior blank lines (paragraph
+    breaks) can be preserved.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if _TOOL_CALL_PREFIX_RE.match(line) or _SPINNER_PREFIX_RE.match(line):
+        return True
+    if _STATUS_FOOTER_RE.search(stripped):
+        return True
+    # A line made entirely of box-drawing/rule characters is decoration
+    # (e.g. a horizontal divider), not content.
+    if not _BOX_CHARS_RE.sub("", stripped).strip("-—_= "):
+        return True
+    return False
+
+
+def _clean_response_lines(lines: list[str]) -> str:
+    """Drop chrome lines, then trim leading/trailing blanks.
+
+    Interior blank lines are preserved so multi-paragraph and bulleted
+    responses keep their formatting -- only chrome lines are removed, never
+    collapsed/re-flowed.
+    """
+    kept = [line for line in lines if not _is_chrome_line(line)]
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return "\n".join(kept)
+
+
+def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> Optional[str]:
+    """Extract Claude's response immediately preceding the completion marker.
+
+    Returns None if the marker hasn't appeared yet (keep polling). Once
+    found, always returns a string -- possibly empty if nothing extractable
+    precedes the marker; the caller maps that to EXTRACTION_FAILURE rather
+    than reporting a silent empty success.
 
     The marker must appear *alone* on its line (after stripping leading/
-    trailing whitespace) to count. A plain substring match would also match
-    the echoed, just-submitted prompt -- which necessarily contains the
-    marker text, since the prompt asks Claude to repeat it back -- causing
-    a false "done" the moment the prompt is echoed, before Claude has
-    produced any real output (or reached an approval prompt).
+    trailing whitespace) to count as the completion line. A plain substring
+    match would also match the echoed, just-submitted prompt -- which
+    necessarily contains the marker text, since the prompt asks Claude to
+    repeat it back -- causing a false "done" the moment the prompt is
+    echoed, before Claude has produced any real output.
+
+    The start of the response is anchored on that same echoed-prompt line
+    (found by searching for the marker as a *substring*, since it is a
+    fresh random value per call and so cannot coincidentally appear
+    anywhere else in the pane) rather than *pre_line_count* alone. Claude
+    Code's TUI repaints its whole viewport per frame and can settle to a
+    different total line count than the pre-send snapshot (e.g. a prior
+    turn's tool output collapsing once no longer active) -- a stale
+    count-based boundary can then land past the real response, so the echo
+    search is *not* bounded by pre_line_count: the marker's uniqueness
+    already guarantees any line containing it (other than the exact-match
+    completion line) is this submission's own echo, not older history, so
+    finding it anywhere below the marker is a safe, authoritative boundary
+    in its own right. When no echo line is found at all (e.g. simple/
+    synthetic pane content with no embedded marker substring), *pre_line_count*
+    is used as a fallback floor instead.
     """
     clean_lines = _strip_ansi(post_raw).splitlines()
 
@@ -283,8 +371,17 @@ def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> O
     if done_idx is None:
         return None
 
-    response_lines = clean_lines[pre_line_count:done_idx]
-    return _redact_credentials("\n".join(response_lines).strip())
+    echo_idx = None
+    for i in range(done_idx - 1, -1, -1):
+        line = clean_lines[i]
+        if done_marker in line and line.strip() != done_marker:
+            echo_idx = i
+            break
+
+    start_idx = echo_idx + 1 if echo_idx is not None else pre_line_count
+
+    response = _clean_response_lines(clean_lines[start_idx:done_idx])
+    return _redact_credentials(response)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -321,6 +418,9 @@ def submit_prompt(
     APPROVAL_REQUIRED Claude Code is blocked on an interactive approval
                       prompt ("Do you want to proceed?"). Detected as soon
                       as it appears, not automatically approved.
+    EXTRACTION_FAILURE The completion marker was seen, but no response text
+                      could be extracted from the pane -- never reported as
+                      a silent empty SUCCESS.
     AUTH_FAILURE      Pane shows authentication or OAuth error at timeout.
     SESSION_MISSING   Named tmux session does not exist.
     SESSION_DEAD      Session exists but has no responsive pane.
@@ -418,6 +518,18 @@ def _run_prompt(
 
         response = _extract_response(pre_line_count, post_raw, done_marker)
         if response is not None:
+            if not response.strip():
+                logger.warning(
+                    "bridge: completion marker seen but no response extracted run_id=%s",
+                    run_id,
+                )
+                return BridgeResult(
+                    status=BridgeStatus.EXTRACTION_FAILURE,
+                    error=(
+                        f"Claude Code finished in tmux session {session!r}, but no "
+                        "response text could be extracted from the pane."
+                    ),
+                )
             logger.debug("bridge: done run_id=%s chars=%d", run_id, len(response))
             return BridgeResult(status=BridgeStatus.SUCCESS, response=response)
 
