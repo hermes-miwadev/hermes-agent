@@ -38,7 +38,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,15 @@ logger = logging.getLogger(__name__)
 # messages straight to Claude Code, deterministically, every time."
 CLAUDE_DEFAULT_MODE = "claude_default"
 _SUPPORTED_MODES = frozenset({CLAUDE_DEFAULT_MODE})
+
+# The bridge's own per-call default (agent.claude_code_tmux_bridge.WorkerConfig
+# .timeout) is 300s -- fine for a synchronous /cc-delegate wait, but auto-routed
+# tasks acknowledge immediately and finish in the background, so there is no
+# reason to abandon a still-working Claude Code session that early. 30 minutes
+# is a generous default background ceiling; configurable per mapping via
+# `background_timeout_seconds` for channels that routinely run longer (or
+# operators who want a tighter bound).
+DEFAULT_BACKGROUND_TIMEOUT_SECONDS = 1800.0
 
 DEFAULT_STANDARD_INSTRUCTIONS = (
     "Standard implementation requirements for this task: inspect the current "
@@ -81,6 +90,7 @@ class RoutingMapping:
     workspace: str
     mode: str
     standard_instructions: Optional[str]  # None => omit the standard block
+    background_timeout_seconds: float = DEFAULT_BACKGROUND_TIMEOUT_SECONDS
 
 
 def _coerce_bool(value: Any, *, default: bool) -> bool:
@@ -141,6 +151,10 @@ def parse_routing_mapping(entry: Any) -> RoutingMapping:
             f"mode {mode!r} (supported: {', '.join(sorted(_SUPPORTED_MODES))})"
         )
 
+    background_timeout_seconds = _resolve_background_timeout(
+        entry.get("background_timeout_seconds"), channel_id=channel_id
+    )
+
     return RoutingMapping(
         platform=str(entry.get("platform") or "discord").strip().lower(),
         channel_id=channel_id,
@@ -151,7 +165,26 @@ def parse_routing_mapping(entry: Any) -> RoutingMapping:
         standard_instructions=_resolve_standard_instructions(
             entry.get("standard_instructions")
         ),
+        background_timeout_seconds=background_timeout_seconds,
     )
+
+
+def _resolve_background_timeout(raw: Any, *, channel_id: str) -> float:
+    if raw is None:
+        return DEFAULT_BACKGROUND_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise RoutingConfigError(
+            f"claude_routing entry for channel {channel_id!r} has a non-numeric "
+            f"'background_timeout_seconds' ({raw!r})"
+        ) from None
+    if value <= 0:
+        raise RoutingConfigError(
+            f"claude_routing entry for channel {channel_id!r} has a non-positive "
+            f"'background_timeout_seconds' ({value!r})"
+        )
+    return value
 
 
 def load_routing_mappings(config: Any) -> list[RoutingMapping]:
@@ -240,20 +273,42 @@ def build_auto_routed_prompt(mapping: RoutingMapping, user_text: str) -> str:
     return user_text
 
 
-def format_auto_routing_ack(mapping: RoutingMapping, request: Any) -> str:
-    """Operator-facing acknowledgement sent as soon as auto-routing fires.
+def format_auto_routing_ack(mapping: RoutingMapping, request: Any, *, task_id: str) -> str:
+    """Operator-facing acknowledgement sent immediately when auto-routing fires.
 
     Reuses ``agent.claude_code_delegate.format_ack`` for the worker/
     workspace/prompt-preview body (identical to a manual ``/cc-delegate``
-    ack) and adds the framing that distinguishes an automatic delegation
-    from one an operator typed explicitly. The eventual completion/
-    approval-required/busy/auth-failure/timeout/failure status is
+    ack) and adds: the framing that distinguishes an automatic delegation
+    from one an operator typed explicitly, a stable task ID (also usable
+    with ``/cc-tasks`` to check status later), and an explicit confirmation
+    that the result is posted asynchronously -- this call returns before
+    Claude Code has done any work. The eventual completion/approval-
+    required/busy/auth-failure/timeout/extraction-failure/failure status is
     delivered separately, through the same bridge-status formatting
-    ``/cc-delegate`` uses (see ``agent.claude_code_delegate.format_result``).
+    ``/cc-delegate`` uses (see ``agent.claude_code_delegate.format_result``),
+    once the background task finishes (up to
+    ``mapping.background_timeout_seconds`` later).
     """
     from agent.claude_code_delegate import format_ack
 
     return (
         f"🤖 Automatic routing activated (mode: `{mapping.mode}`)\n"
-        f"{format_ack(request)}"
+        f"Task ID: `{task_id}`\n"
+        f"{format_ack(request)}\n"
+        f"I'll post {mapping.worker}'s result back here (or in this thread) once it's "
+        f"done -- no need to wait."
+    )
+
+
+def format_duplicate_task_notice(task_id: str, existing_task: Dict[str, Any]) -> str:
+    """Operator-facing notice when a duplicate/replayed event is suppressed.
+
+    *existing_task* is a row from ``gateway.claude_task_registry`` (same
+    shape as ``find_task``/``list_recent_tasks`` return).
+    """
+    execution_state = existing_task.get("execution_state", "unknown")
+    delivery_state = existing_task.get("delivery_state", "unknown")
+    return (
+        f"🔁 This request was already dispatched as task `{task_id}` -- not starting "
+        f"a duplicate. Execution: `{execution_state}`, delivery: `{delivery_state}`."
     )

@@ -44,6 +44,11 @@ class DelegateRequest:
     workspace: str
     requested_subpath: Optional[str]
     prompt: str
+    # None -> the bridge falls back to the worker's own configured timeout
+    # (default 300s). /cc-delegate never sets this. Auto-routing sets it to
+    # its configurable background-worker timeout so a long task isn't
+    # abandoned at 300s just because that's the bridge's own default.
+    timeout: Optional[float] = None
 
     @property
     def bridge_prompt(self) -> str:
@@ -149,11 +154,18 @@ def resolve_workspace(worker: WorkerConfig, requested_path: Optional[str]) -> st
     return str(resolved)
 
 
-def build_request(worker_name: str, requested_path: Optional[str], prompt: str) -> DelegateRequest:
+def build_request(
+    worker_name: str,
+    requested_path: Optional[str],
+    prompt: str,
+    *,
+    timeout: Optional[float] = None,
+) -> DelegateRequest:
     """Resolve and validate a parsed invocation into a ``DelegateRequest``.
 
     Combines ``resolve_worker`` and ``resolve_workspace``; raises the same
-    ``DelegateValidationError`` as either.
+    ``DelegateValidationError`` as either. *timeout* is opt-in and passed
+    straight through to the resulting request -- see ``DelegateRequest.timeout``.
     """
     worker = resolve_worker(worker_name)
     workspace = resolve_workspace(worker, requested_path)
@@ -163,6 +175,7 @@ def build_request(worker_name: str, requested_path: Optional[str], prompt: str) 
         workspace=workspace,
         requested_subpath=requested_path,
         prompt=prompt,
+        timeout=timeout,
     )
 
 

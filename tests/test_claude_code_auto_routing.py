@@ -254,11 +254,13 @@ class TestFormatAutoRoutingAck:
     def test_includes_activation_framing_and_delegate_ack(self):
         mapping = parse_routing_mapping(_entry())
         request = build_request(mapping.worker, mapping.workspace, "Task: ship it.\n\ninstructions")
-        ack = format_auto_routing_ack(mapping, request)
+        ack = format_auto_routing_ack(mapping, request, task_id="cc-testtask123")
         assert "Automatic routing activated" in ack
         assert CLAUDE_DEFAULT_MODE in ack
         assert "claude-momentum" in ack
         assert "/home/michael/code/momentum-studio" in ack
+        assert "cc-testtask123" in ack
+        assert "post" in ack.lower()  # confirms the result-posted-later framing
 
 
 # ── RoutingMapping is a plain, hashable-by-value dataclass ──────────────────

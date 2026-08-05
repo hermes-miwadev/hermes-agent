@@ -3238,12 +3238,23 @@ class GatewaySlashCommandsMixin:
         request: "DelegateRequest",
         source: "SessionSource",
         event_message_id: Optional[str] = None,
+        *,
+        task_id: Optional[str] = None,
+        message_ref: Optional[str] = None,
     ) -> None:
         """Submit the delegated prompt to the tmux bridge and deliver the result.
 
         Runs the (blocking) bridge call off the event loop via a thread, then
         sends the sanitised response -- or the mapped error status -- back to
         the chat the command was invoked from.
+
+        ``task_id``/``message_ref`` are opt-in (only auto-routing passes
+        them; plain /cc-delegate leaves both None and this behaves exactly
+        as before). When set, the completion is tracked through
+        gateway.claude_task_registry (execution/delivery state, keyed by
+        task_id) and gateway.delivery_ledger (crash-safe redelivery of a
+        response that was generated but not yet confirmed-sent, keyed by
+        message_ref) -- both reused as-is, not duplicated here.
         """
         from agent.claude_code_delegate import format_result
         from agent.claude_code_tmux_bridge import submit_prompt
@@ -3254,31 +3265,157 @@ class GatewaySlashCommandsMixin:
                 "No adapter for platform %s in cc-delegate task (worker=%s)",
                 source.platform, request.worker_name,
             )
+            if task_id:
+                from gateway.claude_task_registry import mark_task_delivery
+
+                await asyncio.to_thread(
+                    mark_task_delivery, task_id, "failed", "no adapter available for platform"
+                )
             return
 
         thread_metadata = self._thread_metadata_for_source(source, event_message_id)
 
+        # request.timeout is None for plain /cc-delegate (bridge falls back
+        # to the worker's own configured default); auto-routing sets it to
+        # its configurable background-worker timeout. Omitted entirely
+        # rather than passed as timeout=None so the call signature (and
+        # existing /cc-delegate tests asserting it) is unchanged when unset.
+        submit_kwargs = {"timeout": request.timeout} if request.timeout is not None else {}
+
         try:
             result = await asyncio.to_thread(
-                submit_prompt, request.worker_name, request.bridge_prompt
+                submit_prompt, request.worker_name, request.bridge_prompt, **submit_kwargs
             )
         except Exception as exc:
             logger.exception(
                 "cc-delegate: unexpected error calling bridge for worker %s",
                 request.worker_name,
             )
-            await adapter.send(
-                chat_id=source.chat_id,
+            await self._deliver_cc_delegate_result(
+                adapter=adapter,
+                source=source,
                 content=f"⚠️ Delegation to `{request.worker_name}` failed: {exc}",
-                metadata=thread_metadata,
+                thread_metadata=thread_metadata,
+                task_id=task_id,
+                message_ref=message_ref,
+                bridge_status="failure",
             )
             return
 
-        await adapter.send(
-            chat_id=source.chat_id,
+        await self._deliver_cc_delegate_result(
+            adapter=adapter,
+            source=source,
             content=format_result(request.worker_name, result),
-            metadata=thread_metadata,
+            thread_metadata=thread_metadata,
+            task_id=task_id,
+            message_ref=message_ref,
+            bridge_status=result.status.value,
         )
+
+    async def _deliver_cc_delegate_result(
+        self,
+        *,
+        adapter,
+        source: "SessionSource",
+        content: str,
+        thread_metadata,
+        task_id: Optional[str],
+        message_ref: Optional[str],
+        bridge_status: str,
+    ) -> None:
+        """Record + send a finished cc-delegate/auto-routing result once.
+
+        Three independent, best-effort layers, each optional and each
+        never allowed to block or suppress the actual delivery attempt:
+          1. claude_task_registry: execution_state -> 'finished' (task_id).
+          2. delivery_ledger: record_obligation/mark_attempting BEFORE the
+             send, so a crash between here and a confirmed send is
+             redelivered automatically at next boot (message_ref).
+          3. The actual adapter.send(), then mark_delivered/mark_failed and
+             the task registry's delivery_state, reflecting what actually
+             happened.
+        """
+        if task_id:
+            from gateway.claude_task_registry import mark_task_finished
+
+            try:
+                await asyncio.to_thread(
+                    mark_task_finished,
+                    task_id,
+                    bridge_status=bridge_status,
+                    response_preview=content,
+                )
+            except Exception:
+                logger.debug("claude task registry update failed (non-fatal)", exc_info=True)
+
+        obligation_id = None
+        if message_ref:
+            try:
+                from gateway.delivery_ledger import (
+                    compute_obligation_id,
+                    ledger_enabled,
+                    mark_attempting,
+                    record_obligation,
+                )
+
+                if await asyncio.to_thread(ledger_enabled):
+                    session_key = self._session_key_for_source(source)
+                    obligation_id = compute_obligation_id(session_key, message_ref, content)
+                    await asyncio.to_thread(
+                        record_obligation,
+                        obligation_id=obligation_id,
+                        session_key=session_key,
+                        platform=source.platform.value if source.platform else "",
+                        chat_id=source.chat_id,
+                        thread_id=source.thread_id,
+                        content=content,
+                    )
+                    await asyncio.to_thread(mark_attempting, obligation_id)
+            except Exception:
+                logger.debug("delivery ledger record failed (non-fatal)", exc_info=True)
+                obligation_id = None
+
+        delivered = False
+        delivery_error = ""
+        try:
+            send_result = await adapter.send(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=thread_metadata,
+            )
+            # Consistent with gateway.delivery_ledger's own redelivery code:
+            # default False (never claim a delivered obligation absent an
+            # explicit success flag) rather than assuming success.
+            delivered = bool(getattr(send_result, "success", False))
+            if not delivered:
+                delivery_error = str(getattr(send_result, "error", "") or "send failed")
+        except Exception as exc:
+            delivery_error = str(exc)
+            logger.exception("cc-delegate: failed to deliver result to chat")
+
+        if obligation_id:
+            from gateway.delivery_ledger import mark_delivered, mark_failed
+
+            try:
+                if delivered:
+                    await asyncio.to_thread(mark_delivered, obligation_id)
+                else:
+                    await asyncio.to_thread(mark_failed, obligation_id, delivery_error)
+            except Exception:
+                logger.debug("delivery ledger update failed (non-fatal)", exc_info=True)
+
+        if task_id:
+            from gateway.claude_task_registry import mark_task_delivery
+
+            try:
+                await asyncio.to_thread(
+                    mark_task_delivery,
+                    task_id,
+                    "delivered" if delivered else "failed",
+                    delivery_error,
+                )
+            except Exception:
+                logger.debug("claude task registry delivery update failed (non-fatal)", exc_info=True)
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast

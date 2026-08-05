@@ -9,6 +9,7 @@ tests/gateway/test_discord_thread_reliability.py.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -43,6 +44,7 @@ def _make_event(
     parent_chat_id=None,
     is_bot=False,
     media_urls=None,
+    message_id=None,
 ):
     source = SessionSource(
         platform=platform,
@@ -52,7 +54,9 @@ def _make_event(
         is_bot=is_bot,
         user_name="Michael",
     )
-    return MessageEvent(text=text, source=source, media_urls=list(media_urls or []))
+    return MessageEvent(
+        text=text, source=source, media_urls=list(media_urls or []), message_id=message_id
+    )
 
 
 def _make_runner(config=None):
@@ -70,6 +74,22 @@ def _restore_worker_registry():
     yield
     _WORKERS.clear()
     _WORKERS.update(snapshot)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_db(tmp_path, monkeypatch):
+    """Isolated state.db per test for the Phase 4 task registry + delivery
+    ledger, both exercised by _dispatch_auto_routed_delegation /
+    _run_cc_delegate_task. Mirrors tests/gateway/test_delivery_ledger.py's
+    explicit _db_path patch -- without this, duplicate-suppression tests
+    could see stale rows a previous test in the same session left behind."""
+    import gateway.claude_task_registry as task_registry
+    import gateway.delivery_ledger as delivery_ledger
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(task_registry, "_db_path", lambda: home / "state.db")
+    monkeypatch.setattr(delivery_ledger, "_db_path", lambda: home / "state.db")
 
 
 # ---------------------------------------------------------------------------
@@ -477,3 +497,436 @@ class TestAutoRoutingWithoutNemoRelay:
         mock_adapter.send.assert_called_once()
         content = mock_adapter.send.call_args.kwargs["content"]
         assert "Shipped it." in content
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: asynchronous completion delivery
+#
+# Auto-routing already acknowledged immediately and ran the bridge call in
+# a background asyncio task (Phase 3). Phase 4 adds: a stable task ID in
+# the ack, a configurable background-worker timeout longer than the
+# bridge's 300s default, duplicate-event suppression keyed by the
+# triggering message, and delivery to the originating thread/channel with
+# durable state surviving a restart -- all layered on top of the same
+# unchanged bridge/delegation machinery.
+# ---------------------------------------------------------------------------
+
+
+class TestImmediateAcknowledgementAndTaskId:
+    @pytest.mark.asyncio
+    async def test_ack_returns_before_bridge_call_completes(self):
+        """The ack is returned as soon as the background task is scheduled --
+        it does not wait for submit_prompt, however long that takes."""
+        runner = _make_runner(config=_routing_config())
+        event = _make_event("Ship the pricing page.", message_id="msg-immediate")
+
+        never_returns = asyncio.Event()
+
+        def _blocking_submit(*args, **kwargs):
+            # A real bridge call would block synchronously in a thread;
+            # simulate "still running" by never returning during the test.
+            never_returns.set()
+            raise AssertionError("submit_prompt should not have been awaited yet")
+
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", side_effect=_blocking_submit):
+            result = await asyncio.wait_for(
+                runner._maybe_auto_route_to_claude(event, event.source), timeout=2.0
+            )
+
+        assert result is not None
+        assert "Automatic routing activated" in result
+        # The background task exists but we deliberately never awaited it,
+        # proving the ack did not wait on the bridge call.
+        assert len(runner._background_tasks) == 1
+        for task in list(runner._background_tasks):
+            task.cancel()
+
+    @pytest.mark.asyncio
+    async def test_ack_contains_worker_workspace_and_stable_task_id(self):
+        runner = _make_runner(config=_routing_config())
+        event = _make_event("Ship the pricing page.", message_id="msg-fields")
+
+        with patch("gateway.run.GatewayRunner._run_cc_delegate_task", new_callable=AsyncMock):
+            result = await runner._maybe_auto_route_to_claude(event, event.source)
+
+        assert "claude-momentum" in result
+        assert "/home/michael/code/momentum-studio" in result
+        assert "Task ID: `cc-" in result
+        assert "posted" in result.lower() or "post" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_task_id_is_stable_for_the_same_message(self):
+        from gateway.claude_task_registry import compute_task_id
+
+        runner = _make_runner(config=_routing_config())
+        event = _make_event("Ship the pricing page.", message_id="msg-stable")
+        session_key = runner._session_key_for_source(event.source)
+        expected = compute_task_id(session_key, "msg-stable", "claude-momentum")
+
+        with patch("gateway.run.GatewayRunner._run_cc_delegate_task", new_callable=AsyncMock):
+            result = await runner._maybe_auto_route_to_claude(event, event.source)
+
+        assert expected in result
+
+
+class TestDelayedCompletionDelivery:
+    @pytest.mark.asyncio
+    async def test_result_delivered_after_ack_once_bridge_finishes(self):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-delayed")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            ack = await runner._maybe_auto_route_to_claude(event, event.source)
+            # At this point nothing has been sent to Discord yet.
+            mock_adapter.send.assert_not_called()
+            for task in list(runner._background_tasks):
+                await task
+
+        assert "Task ID:" in ack
+        mock_adapter.send.assert_called_once()
+        assert "Shipped it." in mock_adapter.send.call_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_task_longer_than_300_seconds_uses_background_timeout_not_bridge_default(self):
+        """The bridge's own per-call default is 300s. Auto-routing must pass
+        a configurable, longer background-worker timeout explicitly, so a
+        task that legitimately runs past 300s is still waited for instead
+        of being abandoned at the bridge's default ceiling."""
+        runner = _make_runner(config=_routing_config(background_timeout_seconds=3600))
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Do a very long task.", message_id="msg-long")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Finally done.")
+        with patch(
+            "agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result
+        ) as mock_submit:
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        assert mock_submit.call_args.kwargs["timeout"] == 3600
+        assert mock_submit.call_args.kwargs["timeout"] > 300
+
+    @pytest.mark.asyncio
+    async def test_default_background_timeout_exceeds_300_seconds(self):
+        from agent.claude_code_auto_routing import DEFAULT_BACKGROUND_TIMEOUT_SECONDS
+
+        assert DEFAULT_BACKGROUND_TIMEOUT_SECONDS > 300
+
+        runner = _make_runner(config=_routing_config())  # no override -> default
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-default-timeout")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="done")
+        with patch(
+            "agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result
+        ) as mock_submit:
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        assert mock_submit.call_args.kwargs["timeout"] == DEFAULT_BACKGROUND_TIMEOUT_SECONDS
+
+    @pytest.mark.parametrize("status,expect_snippet", [
+        (BridgeStatus.APPROVAL_REQUIRED, "boom"),
+        (BridgeStatus.TIMEOUT, "timed out"),
+        (BridgeStatus.BUSY, "already handling"),
+        (BridgeStatus.AUTH_FAILURE, "re-authenticate"),
+        (BridgeStatus.SESSION_MISSING, "no running tmux session"),
+        (BridgeStatus.SESSION_DEAD, "no live pane"),
+        (BridgeStatus.EXTRACTION_FAILURE, "boom"),
+        (BridgeStatus.FAILURE, "failed"),
+    ])
+    @pytest.mark.asyncio
+    async def test_every_bridge_outcome_is_delivered_asynchronously(self, status, expect_snippet):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id=f"msg-{status.value}")
+
+        bridge_result = BridgeResult(status=status, error="boom")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert expect_snippet in content
+
+
+class TestDuplicateEventSuppression:
+    @pytest.mark.asyncio
+    async def test_same_message_id_dispatched_twice_only_runs_bridge_once(self):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch(
+            "agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result
+        ) as mock_submit:
+            event1 = _make_event("Ship the pricing page.", message_id="msg-dup")
+            first_ack = await runner._maybe_auto_route_to_claude(event1, event1.source)
+            for task in list(runner._background_tasks):
+                await task
+
+            # A second, independent MessageEvent carrying the SAME Discord
+            # message_id -- simulating a gateway RESUME replay, missed-
+            # message backfill, or a retried dispatch of the same event.
+            event2 = _make_event("Ship the pricing page.", message_id="msg-dup")
+            second_ack = await runner._maybe_auto_route_to_claude(event2, event2.source)
+
+        mock_submit.assert_called_once()
+        mock_adapter.send.assert_called_once()
+        assert "Task ID:" in first_ack
+        assert "already dispatched" in second_ack
+        assert "🔁" in second_ack
+
+    @pytest.mark.asyncio
+    async def test_duplicate_notice_reports_current_state(self):
+        runner = _make_runner(config=_routing_config())
+        event1 = _make_event("Ship the pricing page.", message_id="msg-dup-state")
+        with patch("gateway.run.GatewayRunner._run_cc_delegate_task", new_callable=AsyncMock):
+            await runner._maybe_auto_route_to_claude(event1, event1.source)
+
+        event2 = _make_event("Ship the pricing page.", message_id="msg-dup-state")
+        second_ack = await runner._maybe_auto_route_to_claude(event2, event2.source)
+
+        assert "Execution: `running`" in second_ack
+        assert "delivery: `pending`" in second_ack
+
+    @pytest.mark.asyncio
+    async def test_different_message_id_same_text_is_not_suppressed(self):
+        """Two genuinely distinct messages with identical text are two
+        separate requests -- only a literal replay of the SAME message_id
+        is a duplicate."""
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="done")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result) as mock_submit:
+            event1 = _make_event("Ship the pricing page.", message_id="msg-a")
+            await runner._maybe_auto_route_to_claude(event1, event1.source)
+            for task in list(runner._background_tasks):
+                await task
+
+            event2 = _make_event("Ship the pricing page.", message_id="msg-b")
+            ack2 = await runner._maybe_auto_route_to_claude(event2, event2.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        assert mock_submit.call_count == 2
+        assert "already dispatched" not in ack2
+
+
+class TestThreadAndChannelFallback:
+    @pytest.mark.asyncio
+    async def test_delivers_into_the_originating_thread_when_present(self):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event(
+            "Ship the pricing page.", chat_id=THREAD_ID, parent_chat_id=CHANNEL_ID,
+            message_id="msg-thread",
+        )
+        event.source.thread_id = THREAD_ID
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="done")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        _, kwargs = mock_adapter.send.call_args
+        assert kwargs["chat_id"] == THREAD_ID
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_channel_when_no_thread(self):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-no-thread")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="done")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        _, kwargs = mock_adapter.send.call_args
+        assert kwargs["chat_id"] == CHANNEL_ID
+
+
+class TestNoFallbackToHermesOpenAI:
+    @pytest.mark.asyncio
+    async def test_long_running_task_never_invokes_the_normal_agent_loop(self):
+        """Requirement: never report a timeout (or silently swap in Hermes/
+        OpenAI implementation work) merely because nothing is still waiting
+        on the originating request. The background task is independent of
+        the dispatch coroutine returning."""
+        runner = _make_runner(config=_routing_config())
+        runner.handle_message = AsyncMock()  # stands in for the normal agent-loop entry point
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-no-agent-loop")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            result = await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        assert result is not None  # never None -> caller never falls through to the agent loop
+        runner.handle_message.assert_not_awaited()
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert content == "✅ `claude-momentum`:\nShipped it."
+
+
+class TestRestartRecovery:
+    @pytest.mark.asyncio
+    async def test_sweep_marks_still_running_task_interrupted(self):
+        from gateway.claude_task_registry import (
+            EXECUTION_INTERRUPTED,
+            EXECUTION_RUNNING,
+            find_task,
+            record_task_started,
+        )
+
+        runner = _make_runner()
+        task_id = "cc-restart-test"
+        record_task_started(
+            task_id,
+            session_key="discord:1:2", platform="discord", chat_id="1", thread_id=None,
+            worker="claude-momentum", workspace="/home/michael/code/momentum-studio",
+            prompt_preview="do the thing",
+        )
+        assert find_task(task_id)["execution_state"] == EXECUTION_RUNNING
+
+        # Simulate the owning process being long gone (a previous gateway boot).
+        import sqlite3
+
+        from gateway.claude_task_registry import _db_path
+
+        with sqlite3.connect(_db_path()) as conn:
+            conn.execute(
+                "UPDATE claude_auto_tasks SET owner_pid=? WHERE task_id=?",
+                (999999999, task_id),
+            )
+
+        count = await runner._sweep_interrupted_claude_tasks()
+
+        assert count == 1
+        assert find_task(task_id)["execution_state"] == EXECUTION_INTERRUPTED
+
+    @pytest.mark.asyncio
+    async def test_completed_but_undelivered_result_is_recoverable_via_delivery_ledger(self):
+        """The 'supported' restart-recovery case: a bridge call that
+        finished but crashed before a confirmed send is redelivered by the
+        EXISTING gateway.delivery_ledger sweep (gateway/run.py's
+        _redeliver_pending_obligations, unchanged), not a new mechanism."""
+        from gateway.delivery_ledger import sweep_recoverable
+
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-crash-before-send")
+
+        # Simulate a send that never got a chance to complete (process died
+        # mid-send) by making adapter.send raise.
+        mock_adapter.send.side_effect = RuntimeError("process died mid-send")
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        # The obligation is recorded and NOT marked delivered -- claimable
+        # by the next boot's sweep once this (test) process looks dead.
+        claimed = sweep_recoverable(deliverable_platforms={"discord"})
+        # This process is alive (it's running the test), so nothing is
+        # claimed yet -- demonstrates the row exists and is still owned,
+        # not lost. A real restart (dead owner pid) would let it through.
+        assert claimed == []
+
+        from gateway.delivery_ledger import _connect
+
+        with _connect() as conn:
+            row = conn.execute(
+                "SELECT state, content FROM delivery_obligations WHERE chat_id=?",
+                (CHANNEL_ID,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] in ("attempting", "failed")
+        assert "Shipped it." in row[1]
+
+    @pytest.mark.asyncio
+    async def test_interrupted_task_does_not_block_a_genuinely_new_message(self):
+        """A follow-up message (even identical text) has its own message_id
+        and therefore its own task_id -- an earlier interrupted task must
+        not block it."""
+        from gateway.claude_task_registry import record_task_started
+
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        old_session_key = runner._session_key_for_source(
+            _make_event("x", message_id="irrelevant").source
+        )
+        record_task_started(
+            "cc-old-interrupted",
+            session_key=old_session_key, platform="discord", chat_id=CHANNEL_ID, thread_id=None,
+            worker="claude-momentum", workspace="/home/michael/code/momentum-studio",
+            prompt_preview="an old, now-interrupted task",
+        )
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result) as mock_submit:
+            new_event = _make_event("Ship the pricing page.", message_id="msg-brand-new")
+            result = await runner._maybe_auto_route_to_claude(new_event, new_event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        assert "already dispatched" not in result
+        mock_submit.assert_called_once()
+
+
+class TestCcTasksCommand:
+    @pytest.mark.asyncio
+    async def test_no_tasks_yet(self):
+        runner = _make_runner()
+        event = _make_event("/cc-tasks")
+        result = await runner._handle_cc_tasks_command(event)
+        assert "No automatically-routed" in result
+
+    @pytest.mark.asyncio
+    async def test_lists_task_id_worker_workspace_execution_and_delivery_state(self):
+        runner = _make_runner(config=_routing_config())
+        mock_adapter = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        event = _make_event("Ship the pricing page.", message_id="msg-for-listing")
+
+        bridge_result = BridgeResult(status=BridgeStatus.SUCCESS, response="Shipped it.")
+        with patch("agent.claude_code_tmux_bridge.submit_prompt", return_value=bridge_result):
+            await runner._maybe_auto_route_to_claude(event, event.source)
+            for task in list(runner._background_tasks):
+                await task
+
+        listing = await runner._handle_cc_tasks_command(_make_event("/cc-tasks"))
+        assert "claude-momentum" in listing
+        assert "/home/michael/code/momentum-studio" in listing
+        assert "finished" in listing
+        assert "delivered" in listing
+
+    @pytest.mark.asyncio
+    async def test_invalid_limit_shows_usage(self):
+        runner = _make_runner()
+        event = _make_event("/cc-tasks not-a-number")
+        result = await runner._handle_cc_tasks_command(event)
+        assert "Usage:" in result

@@ -10,6 +10,8 @@ Lets you mark a specific Discord channel so that ordinary messages there are del
 
 Unlike `/cc-delegate`, which is something *you* type explicitly, auto-routing fires on **plain messages** in a channel you've opted in — so a channel dedicated to one repo's ongoing work can feel like talking directly to Claude Code, without retyping `/cc-delegate` every time.
 
+Delivery is asynchronous: the channel gets an immediate acknowledgement (worker, workspace, and a stable task ID), Claude Code runs in the background for as long as it needs (well past the bridge's normal 300-second default — see [Background-worker timeout](#background-worker-timeout)), and the result posts back to the same thread/channel whenever it's actually done. See [`/cc-tasks`](#checking-task-state-cc-tasks) to check on a task without waiting.
+
 ## Nothing is on by default
 
 No channel is auto-routed until you add a `claude_routing` entry to `config.yaml` (below). Without that config, this feature does nothing — every message goes through Hermes exactly as it always has.
@@ -27,6 +29,7 @@ claude_routing:
     workspace: /home/michael/code/momentum-studio  # must be the worker's root or a subdirectory of it
     mode: claude_default
     standard_instructions: true         # true (default block), false (omit), or custom text
+    background_timeout_seconds: 1800    # optional; defaults to 1800 (30 min)
 ```
 
 | Field | Required | Meaning |
@@ -38,6 +41,7 @@ claude_routing:
 | `workspace` | **yes** | An absolute path that must resolve to the worker's configured workspace root or a subdirectory of it. Anything else is rejected before it reaches the worker. |
 | `mode` | no (defaults to `claude_default`) | See [Routing modes](#routing-modes) below. |
 | `standard_instructions` | no (defaults to `true`) | `true` includes the built-in requirements block (below); `false` omits it; any other string is used verbatim instead. |
+| `background_timeout_seconds` | no (defaults to `1800`) | How long the background task waits for Claude Code before giving up and reporting a timeout. Must be a positive number. See [Background-worker timeout](#background-worker-timeout). |
 
 Restart the gateway (`hermes gateway restart`) after editing `claude_routing` — it's read from the loaded config, the same as `quick_commands`.
 
@@ -60,6 +64,25 @@ claude_routing:
 ## Routing modes
 
 `claude_default` is the only mode implemented so far: **deterministic, unconditional** delegation. Every plain-text message in the channel that isn't a command and doesn't use the `chat:` bypass goes straight to the configured worker — there's no content-based classification deciding whether a given message "looks like a coding task." That's intentional: an operator opts a whole channel in, rather than Hermes guessing per-message.
+
+## Background-worker timeout
+
+`/cc-delegate` waits synchronously (up to the bridge's own 300-second default) because you're watching for the reply. Auto-routing doesn't have that constraint — it already acknowledged and moved on — so it uses a much longer, separately configurable ceiling: **1800 seconds (30 minutes) by default**, overridable per channel via `background_timeout_seconds`. A task that's still working at the 300-second mark is not abandoned; it's only reported as timed out if it's still running once `background_timeout_seconds` is reached. Set a shorter value for a channel where you want faster failure feedback, or longer for a workspace that routinely runs long test suites or builds.
+
+## Checking task state (`/cc-tasks`)
+
+`/cc-tasks [limit]` (default 10, max 50) lists recent auto-routed tasks: task ID, worker, workspace, **execution state** (`running` / `finished` / `interrupted`), and **delivery state** (`pending` / `delivered` / `failed`). It's read-only — it doesn't retry, cancel, or otherwise act on anything, just shows you what the registry currently has recorded. Useful while a long task is still running, or to confirm a result was actually delivered.
+
+## Duplicate events
+
+A stable task ID is derived deterministically from the triggering Discord message (not randomly), so if the exact same message is ever reprocessed — a gateway reconnect replay, a missed-message backfill, a retried dispatch — auto-routing recognises it and replies with a short "already dispatched" notice instead of starting a second Claude Code task or delivering the result twice. A genuinely new message, even with identical text, gets its own message ID and its own task, and is handled normally.
+
+## Restart recovery
+
+The gateway can restart at any point during a long-running auto-routed task. What happens depends on exactly when:
+
+- **Claude Code finished, but the result wasn't confirmed-delivered yet** (crash between the bridge call returning and the Discord send succeeding) — recovered automatically. This reuses Hermes' existing delivery ledger (the same durable mechanism that protects any other final response), which redelivers the stored result on the next boot.
+- **Claude Code was still working when the gateway died** — **not** automatically recovered. The underlying tmux session and Claude Code process are independent of the gateway and may keep working (or may already be done) in tmux, but nothing is watching for that specific completion anymore after a restart. The task shows as `interrupted` in `/cc-tasks` so this is visible rather than silently lost. Send a fresh message (or use `/cc-delegate` against the same worker to check in) to pick the work back up — it gets a new task ID and proceeds normally.
 
 ## Standard implementation instructions
 
@@ -84,7 +107,7 @@ The `chat:` prefix is stripped and the rest of the message goes to Hermes' norma
 - **Explicit slash commands** (`/status`, `/cc-delegate`, `/<skill-name>`, etc.) are never auto-routed — they dispatch exactly as they do everywhere else.
 - **`/cc-delegate`** still works in an auto-routed channel for one-off delegations to a *different* worker or workspace than the channel's default mapping.
 - **Bot messages** (including Hermes' own) are never auto-routed — no recursive delegation loop.
-- **Duplicate Discord events** are filtered the same way they always are (the gateway's existing message dedup), and a second delegation attempt for a worker that's still busy on the first gets a clear `busy` reply rather than a second Claude Code task.
+- **Duplicate Discord events** are filtered the same way they always are (the gateway's existing message dedup) *and* by task-ID dedup (see [Duplicate events](#duplicate-events)) — a second delegation attempt for a worker that's still busy on the first also gets a clear `busy` reply rather than a second Claude Code task.
 
 ## Failure handling
 
@@ -104,9 +127,10 @@ The original request is never discarded on failure — retry it (or fix the `cla
 
 1. Add a `claude_routing` entry for a test channel and restart the gateway.
 2. Send a plain message in that channel (no leading `/`): `@hermes say hello`.
-3. You should see an immediate **"🤖 Automatic routing activated"** acknowledgement naming the worker and workspace, followed by the worker's response (or a clear busy/approval/failure status) once it's ready.
-4. Confirm `/cc-delegate` and other slash commands still work normally in the same channel.
-5. Confirm `@hermes chat: ...` in that channel goes to Hermes instead.
+3. You should see an immediate **"🤖 Automatic routing activated"** acknowledgement naming the worker, workspace, and a task ID, followed by the worker's response (or a clear busy/approval/failure status) once it's ready — this can take a while for larger tasks, that's expected.
+4. Run `/cc-tasks` to see the task listed, and check its execution/delivery state change from `running`/`pending` to `finished`/`delivered`.
+5. Confirm `/cc-delegate` and other slash commands still work normally in the same channel.
+6. Confirm `@hermes chat: ...` in that channel goes to Hermes instead.
 
 ## Disabling it quickly
 

@@ -123,18 +123,47 @@ class GatewayClaudeAutoRoutingMixin:
         Split out from ``_maybe_auto_route_to_claude`` so the "should this
         message be routed" decision and the "go route it" action are each
         independently testable.
+
+        Idempotent per triggering Discord message: the task_id is derived
+        deterministically from (session, message_id, worker), so a
+        duplicate/replayed event (gateway RESUME replay, missed-message
+        backfill, a retry) for the exact same message recomputes the same
+        task_id and is recognised -- via gateway.claude_task_registry -- as
+        already dispatched, rather than starting a second tmux submission.
+        A genuinely new message (even with identical text) has its own
+        message_id and therefore its own task_id, and proceeds normally.
         """
         from agent.claude_code_auto_routing import (
             build_auto_routed_prompt,
             format_auto_routing_ack,
+            format_duplicate_task_notice,
         )
         from agent.claude_code_delegate import DelegateValidationError, build_request
+        from gateway.claude_task_registry import (
+            compute_task_id,
+            find_task,
+            record_task_started,
+        )
+
+        session_key = self._session_key_for_source(source)
+        message_ref = event.message_id or f"no-message-id-{id(event)}"
+        task_id = compute_task_id(session_key, message_ref, mapping.worker)
+
+        existing = await asyncio.to_thread(find_task, task_id)
+        if existing is not None:
+            logger.info(
+                "Claude auto-routing: duplicate event suppressed for task=%s "
+                "(execution=%s, delivery=%s)",
+                task_id, existing.get("execution_state"), existing.get("delivery_state"),
+            )
+            return format_duplicate_task_notice(task_id, existing)
 
         try:
             request = build_request(
                 mapping.worker,
                 mapping.workspace,
                 build_auto_routed_prompt(mapping, user_text),
+                timeout=mapping.background_timeout_seconds,
             )
         except DelegateValidationError as exc:
             logger.warning(
@@ -147,19 +176,98 @@ class GatewayClaudeAutoRoutingMixin:
                 f"config entry."
             )
 
+        await asyncio.to_thread(
+            record_task_started,
+            task_id,
+            session_key=session_key,
+            platform="discord",
+            chat_id=source.chat_id,
+            thread_id=source.thread_id,
+            worker=mapping.worker,
+            workspace=mapping.workspace,
+            prompt_preview=user_text,
+        )
+
         event_message_id = self._reply_anchor_for_event(event)
 
-        # Fire-and-forget, exactly like /cc-delegate: the bridge call blocks
-        # on tmux polling for up to its configured timeout, so it must not
-        # hold up the gateway event loop or this message's dispatch.
+        # Fire-and-forget: acknowledge now, run the (potentially long)
+        # bridge call in the background, and deliver the result whenever it
+        # actually finishes -- up to mapping.background_timeout_seconds
+        # later. This coroutine returning (and the originating Discord
+        # request/interaction being "done" from Discord's perspective) has
+        # no bearing on the background task: it is an independent
+        # asyncio.create_task, not awaited here, so it is never mistaken
+        # for timed-out just because nothing is still waiting on it.
         _task = asyncio.create_task(
-            self._run_cc_delegate_task(request, source, event_message_id=event_message_id)
+            self._run_cc_delegate_task(
+                request, source,
+                event_message_id=event_message_id,
+                task_id=task_id,
+                message_ref=message_ref,
+            )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
         logger.info(
-            "Claude auto-routing activated: channel=%s worker=%s workspace=%s",
-            source.chat_id, mapping.worker, mapping.workspace,
+            "Claude auto-routing activated: task=%s channel=%s worker=%s workspace=%s",
+            task_id, source.chat_id, mapping.worker, mapping.workspace,
         )
-        return format_auto_routing_ack(mapping, request)
+        return format_auto_routing_ack(mapping, request, task_id=task_id)
+
+    async def _handle_cc_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /cc-tasks [limit] -- operator-facing auto-routed task state.
+
+        Lists recent gateway.claude_task_registry rows: task ID, worker,
+        workspace, execution state (running/finished/interrupted), and
+        delivery state (pending/delivered/failed). Read-only; does not
+        retry, cancel, or otherwise act on any task.
+        """
+        from gateway.claude_task_registry import list_recent_tasks
+
+        raw_limit = event.get_command_args().strip()
+        limit = 10
+        if raw_limit:
+            try:
+                limit = max(1, min(50, int(raw_limit)))
+            except ValueError:
+                return f"Usage: /cc-tasks [limit] -- {raw_limit!r} is not a number."
+
+        tasks = await asyncio.to_thread(list_recent_tasks, limit)
+        if not tasks:
+            return "No automatically-routed Claude Code tasks recorded yet."
+
+        lines = [f"**Recent Claude Code auto-routed tasks** (showing {len(tasks)}):"]
+        for task in tasks:
+            lines.append(
+                f"`{task['task_id']}` — worker `{task['worker']}`, "
+                f"workspace `{task['workspace']}`, "
+                f"execution: `{task['execution_state']}`"
+                + (f" ({task['bridge_status']})" if task.get("bridge_status") else "")
+                + f", delivery: `{task['delivery_state']}`"
+            )
+        return "\n".join(lines)
+
+    async def _sweep_interrupted_claude_tasks(self) -> int:
+        """Startup recovery: mark auto-routed tasks abandoned by a dead
+        gateway process as 'interrupted' (does not resume them -- see
+        gateway.claude_task_registry.sweep_interrupted_tasks for exactly
+        what is and is not recoverable). Returns the count found, for the
+        caller's boot-log line.
+        """
+        from gateway.claude_task_registry import sweep_interrupted_tasks
+
+        try:
+            interrupted = await asyncio.to_thread(sweep_interrupted_tasks)
+        except Exception:
+            logger.debug("claude task registry startup sweep failed", exc_info=True)
+            return 0
+        for task in interrupted:
+            logger.warning(
+                "Claude auto-routing: task %s was still running when the previous "
+                "gateway process exited -- marked interrupted (worker=%s, "
+                "workspace=%s). Its result, if any, was not recovered; a new "
+                "message will start a fresh task.",
+                task["task_id"], task["worker"], task["workspace"],
+            )
+        return len(interrupted)

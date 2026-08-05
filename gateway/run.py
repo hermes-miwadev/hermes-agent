@@ -11332,6 +11332,11 @@ class GatewayRunner(
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
         await self._redeliver_pending_obligations()
+        # Auto-routed Claude Code tasks (Phase 4): mark any task still
+        # 'running' when the previous gateway process exited as
+        # 'interrupted' -- see gateway.claude_task_registry for exactly
+        # what is (and, honestly, is not) recoverable across a restart.
+        await self._sweep_interrupted_claude_tasks()
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 
@@ -15211,6 +15216,9 @@ class GatewayRunner(
 
         if canonical == "cc-delegate":
             return await self._handle_cc_delegate_command(event)
+
+        if canonical == "cc-tasks":
+            return await self._handle_cc_tasks_command(event)
 
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
