@@ -15,7 +15,9 @@ from agent.claude_code_tmux_bridge import (
     BridgeResult,
     BridgeStatus,
     WorkerConfig,
+    _extract_approval_preview,
     _extract_response,
+    _is_approval_required,
     _is_auth_failure,
     _redact_credentials,
     _strip_ansi,
@@ -135,6 +137,138 @@ class TestExtractResponse:
         assert result is not None
         assert "[REDACTED]" in result
         assert "sk-supersecret" not in result
+
+    # ── Regression: the marker must appear ALONE on its line ─────────────────
+    #
+    # A plain substring match also matches the echoed, just-submitted prompt
+    # (which necessarily contains the marker text, since the instrumented
+    # prompt asks Claude to repeat it back). That produced a false empty
+    # "success" the instant the prompt was echoed, before Claude had done
+    # anything -- including before it could even reach an approval prompt.
+
+    def test_ignores_marker_embedded_in_longer_echoed_prompt_line(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = (
+            "prior history\n"
+            f"> delete the tmp dir (When your response is complete, output exactly on its own line: {done})\n"
+        )
+        # No standalone marker line yet -- Claude hasn't finished (or has
+        # paused at an approval prompt). Must NOT be treated as done.
+        assert _extract_response(pre_line_count=1, post_raw=pane, done_marker=done) is None
+
+    def test_matches_exact_marker_even_with_surrounding_whitespace(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = f"pre\nThe answer is 42.\n   {done}   \n"
+        result = _extract_response(1, pane, done)
+        assert result is not None
+        assert "The answer is 42." in result
+
+    def test_finds_real_standalone_marker_not_earlier_embedded_occurrence(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = "\n".join([
+            "prior history",
+            f"> do the thing (When your response is complete, output exactly on its own line: {done})",
+            "The answer is 42.",
+            done,
+        ])
+        result = _extract_response(pre_line_count=1, post_raw=pane, done_marker=done)
+        assert result is not None
+        # With a naive substring match, done_idx would land on the echoed
+        # prompt line (it embeds the marker text too) and the response
+        # would be truncated to "" before ever reaching the real answer.
+        # Finding the real standalone marker instead means the full
+        # in-between content, including the genuine answer, is captured.
+        assert "The answer is 42." in result
+        # The trailing standalone marker line itself is still excluded.
+        assert not result.rstrip().endswith(done)
+
+
+# ── Interactive approval-prompt detection ─────────────────────────────────────
+
+class TestApprovalRequiredDetection:
+    def test_detects_do_you_want_to_proceed_prompt(self):
+        text = "Do you want to proceed?\n1. Yes\n2. No\n"
+        assert _is_approval_required(text) is True
+
+    def test_detects_prompt_with_ink_ui_chevron_and_box(self):
+        text = (
+            "╭──────────────────────╮\n"
+            "│ Bash command          │\n"
+            "│   rm -rf /tmp/foo     │\n"
+            "│ Do you want to proceed? │\n"
+            "│ ❯ 1. Yes              │\n"
+            "│   2. No               │\n"
+            "╰──────────────────────╯\n"
+        )
+        assert _is_approval_required(text) is True
+
+    def test_detects_edit_approval_wording_variant(self):
+        text = "Do you want to make this edit to config.py?\n❯ 1. Yes\n  2. No, and tell Claude what to do differently\n"
+        assert _is_approval_required(text) is True
+
+    def test_no_false_positive_on_unrelated_text_mentioning_yes(self):
+        text = "The test passed. 1. Yes it did. 2. No issues found.\n"
+        assert _is_approval_required(text) is False
+
+    def test_no_false_positive_on_question_without_options(self):
+        text = "Do you want to proceed? I think we should discuss this further first.\n"
+        assert _is_approval_required(text) is False
+
+    def test_no_false_positive_on_plain_response_text(self):
+        text = "The answer is 42.\nHERMES_BRIDGE_DONE_abc123\n"
+        assert _is_approval_required(text) is False
+
+
+class TestApprovalPreviewExtraction:
+    def _approval_pane(self, echoed_prompt_line: str) -> str:
+        return (
+            "prior history\n"
+            f"{echoed_prompt_line}\n"
+            "╭──────────────────────────────╮\n"
+            "│ Bash command                  │\n"
+            "│                                │\n"
+            "│   rm -rf /tmp/foo              │\n"
+            "│                                │\n"
+            "│ Do you want to proceed?       │\n"
+            "│ ❯ 1. Yes                      │\n"
+            "│   2. No                       │\n"
+            "╰──────────────────────────────╯\n"
+        )
+
+    def test_extracts_command_preview_from_approval_box(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = self._approval_pane(
+            f"> delete the tmp dir (When your response is complete, output exactly on its own line: {done})"
+        )
+        new_content = "\n".join(_strip_ansi(pane).splitlines()[1:])
+        preview = _extract_approval_preview(new_content)
+        assert preview is not None
+        assert "rm -rf /tmp/foo" in preview
+
+    def test_preview_never_includes_echoed_prompt_or_marker(self):
+        done = f"HERMES_BRIDGE_DONE_{FAKE_RUN_ID}"
+        pane = self._approval_pane(
+            f"> delete the tmp dir (When your response is complete, output exactly on its own line: {done})"
+        )
+        new_content = "\n".join(_strip_ansi(pane).splitlines()[1:])
+        preview = _extract_approval_preview(new_content)
+        assert preview is not None
+        assert done not in preview
+        assert "own line" not in preview
+        assert "delete the tmp dir" not in preview
+
+    def test_preview_redacts_credentials(self):
+        pane = self._approval_pane("> rotate the key").replace(
+            "rm -rf /tmp/foo", "curl -H 'Authorization: Bearer sk-supersecretlongtokenvalue1234567'"
+        )
+        new_content = "\n".join(_strip_ansi(pane).splitlines()[1:])
+        preview = _extract_approval_preview(new_content)
+        assert preview is not None
+        assert "[REDACTED]" in preview
+        assert "sk-supersecret" not in preview
+
+    def test_returns_none_when_no_approval_prompt_present(self):
+        assert _extract_approval_preview("just a normal response\n") is None
 
 
 # ── Integration tests with mocked tmux helpers ────────────────────────────────
@@ -351,6 +485,105 @@ class TestTimeoutAndAuthFailure:
 
         result = bridge.submit_prompt("claude-momentum", "hi", timeout=30.0)
         assert result.status == BridgeStatus.SUCCESS
+
+
+class TestApprovalRequiredIntegration:
+    """End-to-end submit_prompt() coverage for the approval-required path."""
+
+    def test_returns_approval_required_status_with_preview(self, monkeypatch):
+        run_id = FAKE_RUN_ID
+        pre = "prior history\n"
+        post = (
+            "prior history\n"
+            "╭──────────────────────────────╮\n"
+            "│ Bash command                  │\n"
+            "│   rm -rf /tmp/foo              │\n"
+            "│ Do you want to proceed?       │\n"
+            "│ ❯ 1. Yes                      │\n"
+            "│   2. No                       │\n"
+            "╰──────────────────────────────╯\n"
+        )
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+        _setup_session(monkeypatch)
+        _setup_io(monkeypatch, pre_pane=pre, post_pane=post)
+        monkeypatch.setattr(bridge.time, "sleep", lambda x: None)
+
+        result = bridge.submit_prompt("claude-momentum", "delete the tmp dir", timeout=30.0)
+        assert result.status == BridgeStatus.APPROVAL_REQUIRED
+        assert "claude-momentum" in result.error
+        assert "rm -rf /tmp/foo" in result.error
+        assert result.response == ""
+
+    def test_no_empty_success_when_approval_prompt_present(self, monkeypatch):
+        """Regression for the reported bug: an approval prompt sitting right
+        after the echoed prompt must never be reported as an empty SUCCESS."""
+        run_id = FAKE_RUN_ID
+        done = f"HERMES_BRIDGE_DONE_{run_id}"
+        pre = ""
+        post = (
+            f"> delete the tmp dir (When your response is complete, output exactly on its own line: {done})\n"
+            "Do you want to proceed?\n"
+            "1. Yes\n"
+            "2. No\n"
+        )
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+        _setup_session(monkeypatch)
+        _setup_io(monkeypatch, pre_pane=pre, post_pane=post)
+        monkeypatch.setattr(bridge.time, "sleep", lambda x: None)
+
+        result = bridge.submit_prompt("claude-momentum", "delete the tmp dir", timeout=30.0)
+        assert result.status != BridgeStatus.SUCCESS
+        assert result.status == BridgeStatus.APPROVAL_REQUIRED
+        assert result.response == ""
+
+    def test_completion_marker_still_wins_when_actually_present(self, monkeypatch):
+        """Sanity check: a real completed turn is unaffected by the fix."""
+        run_id = FAKE_RUN_ID
+        done = f"HERMES_BRIDGE_DONE_{run_id}"
+        pre = ""
+        post = f"> refactor utils.py (When your response is complete, output exactly on its own line: {done})\nDone.\n{done}\n"
+
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+        _setup_session(monkeypatch)
+        _setup_io(monkeypatch, pre_pane=pre, post_pane=post)
+        monkeypatch.setattr(bridge.time, "sleep", lambda x: None)
+
+        result = bridge.submit_prompt("claude-momentum", "refactor utils.py", timeout=30.0)
+        assert result.status == BridgeStatus.SUCCESS
+        assert "Done." in result.response
+
+    def test_lock_released_promptly_after_approval_required(self, monkeypatch):
+        """A stuck approval prompt must not hold the per-session lock for the
+        full timeout -- it's detected (and the lock released) on the first
+        poll, not only at timeout."""
+        run_id = FAKE_RUN_ID
+        pre = ""
+        post = "Do you want to proceed?\n1. Yes\n2. No\n"
+
+        monkeypatch.setattr(bridge.uuid, "uuid4", lambda: MagicMock(hex=run_id))
+        _setup_session(monkeypatch)
+        _setup_io(monkeypatch, pre_pane=pre, post_pane=post)
+        monkeypatch.setattr(bridge.time, "sleep", lambda x: None)
+
+        result = bridge.submit_prompt("claude-momentum", "hello", timeout=300.0)
+        assert result.status == BridgeStatus.APPROVAL_REQUIRED
+
+        lock = bridge._get_session_lock("claude-momentum")
+        assert lock.acquire(blocking=False), "lock must be free immediately, not held for the full timeout"
+        lock.release()
+
+    def test_busy_returned_while_worker_stuck_at_approval(self, monkeypatch):
+        """A second delegation to the same worker while the first call is
+        still active gets BUSY, not a silent hang or a second concurrent
+        prompt submitted into the same pane."""
+        _setup_session(monkeypatch)
+        lock = bridge._get_session_lock("claude-momentum")
+        lock.acquire()
+        try:
+            result = bridge.submit_prompt("claude-momentum", "another task")
+            assert result.status == BridgeStatus.BUSY
+        finally:
+            lock.release()
 
 
 class TestSendFailure:

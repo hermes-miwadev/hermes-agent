@@ -157,6 +157,7 @@ class TestRunCcDelegateTask:
     @pytest.mark.parametrize("status,expect_snippet", [
         (BridgeStatus.TIMEOUT, "timed out"),
         (BridgeStatus.BUSY, "already handling"),
+        (BridgeStatus.APPROVAL_REQUIRED, "boom"),
         (BridgeStatus.AUTH_FAILURE, "re-authenticate"),
         (BridgeStatus.SESSION_MISSING, "no running tmux session"),
         (BridgeStatus.SESSION_DEAD, "no live pane"),

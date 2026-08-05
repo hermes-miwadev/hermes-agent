@@ -23,6 +23,15 @@ Notes
   prompts work best.
 * Auth failure is detected only at timeout (not during polling) to avoid
   false positives from unrelated pane history.
+* An interactive approval prompt ("Do you want to proceed?") is detected on
+  every poll (not just at timeout) so a stuck approval doesn't hold the
+  per-session lock for the full timeout window. This phase only detects and
+  reports the state -- it never approves anything automatically.
+* The completion marker must appear alone on its own line to count as done.
+  A substring match would also fire on the *echo* of the just-submitted
+  prompt (which necessarily contains the marker text, since we asked Claude
+  to repeat it back), producing a false empty "success" before Claude has
+  done anything.
 * No tmux session is created automatically; the session must already exist.
 """
 
@@ -71,6 +80,24 @@ _AUTH_FAILURE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Claude Code's interactive tool-approval UI (Bash/Edit/Write/etc. all use
+# the same "Do you want to <verb>...?" + numbered-option shape). Requires
+# both the question *and* a following "1. Yes" option within a short window
+# so we don't fire on Claude's own prose merely discussing permission.
+_APPROVAL_PROMPT_RE = re.compile(
+    r"do\s+you\s+want\s+to\s+[^\n?]{0,80}\?"
+    r"[\s\S]{0,200}?"
+    r"❯?\s*1\.\s*yes\b",
+    re.IGNORECASE,
+)
+
+# Box-drawing / bullet chrome Claude Code's ink-based UI wraps prompts in.
+# Stripped from extracted preview text -- it's rendering noise, not content.
+_BOX_CHARS_RE = re.compile(r"[─-╿]")
+_LEADING_MARKER_RE = re.compile(r"^[\s❯>*\-]+")
+
+_APPROVAL_PREVIEW_MAX_CHARS = 160
+
 
 # ── Public types ──────────────────────────────────────────────────────────────
 
@@ -78,6 +105,7 @@ class BridgeStatus(enum.Enum):
     SUCCESS = "success"
     TIMEOUT = "timeout"
     BUSY = "busy"
+    APPROVAL_REQUIRED = "approval_required"
     AUTH_FAILURE = "auth_failure"
     SESSION_MISSING = "session_missing"
     SESSION_DEAD = "session_dead"
@@ -186,17 +214,69 @@ def _is_auth_failure(text: str) -> bool:
     return bool(_AUTH_FAILURE_RE.search(_strip_ansi(text)))
 
 
+def _is_approval_required(text: str) -> bool:
+    return bool(_APPROVAL_PROMPT_RE.search(text))
+
+
+def _extract_approval_preview(new_content: str) -> Optional[str]:
+    """Best-effort, sanitised preview of what Claude Code is asking to run.
+
+    Only looks at *new_content* -- pane output produced since this specific
+    prompt was submitted -- and only at the lines immediately above the
+    approval question, never at unrelated pane history. The scan stops the
+    instant it reaches the echoed, just-submitted prompt (identified by our
+    own instrumentation text or a leading "> ") so the preview can never
+    include the prompt we sent or its embedded completion marker -- only
+    genuine approval-box content. Returns None when nothing meaningful can
+    be extracted (e.g. the box only contains decoration).
+    """
+    match = _APPROVAL_PROMPT_RE.search(new_content)
+    if match is None:
+        return None
+
+    lines = new_content.splitlines()
+    question_line_idx = new_content[: match.start()].count("\n")
+
+    candidates: list[str] = []
+    floor = max(-1, question_line_idx - 8)
+    for idx in range(question_line_idx - 1, floor, -1):
+        raw_line = lines[idx]
+        if "output exactly on its own line" in raw_line.lower() or raw_line.lstrip().startswith(">"):
+            break
+        cleaned = _BOX_CHARS_RE.sub("", raw_line)
+        cleaned = _LEADING_MARKER_RE.sub("", cleaned).strip()
+        if not cleaned or "do you want to" in cleaned.lower():
+            continue
+        candidates.append(cleaned)
+    candidates.reverse()
+
+    if not candidates:
+        return None
+
+    preview = _redact_credentials(" ".join(candidates))
+    if len(preview) > _APPROVAL_PREVIEW_MAX_CHARS:
+        preview = preview[: _APPROVAL_PREVIEW_MAX_CHARS - 3] + "..."
+    return preview
+
+
 def _extract_response(pre_line_count: int, post_raw: str, done_marker: str) -> Optional[str]:
     """Extract response lines from pane content captured after sending.
 
     Returns lines from *pre_line_count* up to (not including) the done
     marker line, sanitised; or None if the marker is absent.
+
+    The marker must appear *alone* on its line (after stripping leading/
+    trailing whitespace) to count. A plain substring match would also match
+    the echoed, just-submitted prompt -- which necessarily contains the
+    marker text, since the prompt asks Claude to repeat it back -- causing
+    a false "done" the moment the prompt is echoed, before Claude has
+    produced any real output (or reached an approval prompt).
     """
     clean_lines = _strip_ansi(post_raw).splitlines()
 
     done_idx = None
     for i, line in enumerate(clean_lines):
-        if done_marker in line:
+        if line.strip() == done_marker:
             done_idx = i
             break
 
@@ -235,13 +315,16 @@ def submit_prompt(
     -------
     BridgeResult with status one of:
 
-    SUCCESS         Response captured successfully.
-    TIMEOUT         Completion marker not seen before deadline.
-    BUSY            Another call already holds the per-session lock.
-    AUTH_FAILURE    Pane shows authentication or OAuth error at timeout.
-    SESSION_MISSING Named tmux session does not exist.
-    SESSION_DEAD    Session exists but has no responsive pane.
-    FAILURE         Subprocess error or unexpected condition.
+    SUCCESS           Response captured successfully.
+    TIMEOUT           Completion marker not seen before deadline.
+    BUSY              Another call already holds the per-session lock.
+    APPROVAL_REQUIRED Claude Code is blocked on an interactive approval
+                      prompt ("Do you want to proceed?"). Detected as soon
+                      as it appears, not automatically approved.
+    AUTH_FAILURE      Pane shows authentication or OAuth error at timeout.
+    SESSION_MISSING   Named tmux session does not exist.
+    SESSION_DEAD      Session exists but has no responsive pane.
+    FAILURE           Subprocess error or unexpected condition.
     """
     worker = _WORKERS.get(session) or WorkerConfig(session=session, workspace="")
     eff_timeout = timeout if timeout is not None else worker.timeout
@@ -337,6 +420,22 @@ def _run_prompt(
         if response is not None:
             logger.debug("bridge: done run_id=%s chars=%d", run_id, len(response))
             return BridgeResult(status=BridgeStatus.SUCCESS, response=response)
+
+        # No completion marker yet -- check whether Claude Code is blocked
+        # on an interactive approval prompt. Checked every poll (not just
+        # at timeout) so a prompt nobody is watching doesn't hold the
+        # per-session lock for the full timeout. Only ever looks at content
+        # produced since this submission (post pre_line_count), same as the
+        # auth-failure check below, so unrelated pane history is never
+        # inspected or returned.
+        new_content = "\n".join(_strip_ansi(post_raw).splitlines()[pre_line_count:])
+        if _is_approval_required(new_content):
+            preview = _extract_approval_preview(new_content)
+            message = f"Claude Code requires approval in tmux session {session!r}."
+            if preview:
+                message += f" Pending: {preview}"
+            logger.debug("bridge: approval required run_id=%s", run_id)
+            return BridgeResult(status=BridgeStatus.APPROVAL_REQUIRED, error=message)
 
     # Timeout — check whether pane shows an auth error
     try:

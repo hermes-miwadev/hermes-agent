@@ -1096,6 +1096,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Dedup cache: prevents duplicate bot responses when Discord
         # RESUME replays events after reconnects.
         self._dedup = MessageDeduplicator()
+        # Message IDs currently mid-flight through _auto_create_thread().
+        # Guards against a second concurrent/racing auto-thread attempt (and
+        # its own duplicate seed message) for the same incoming message.
+        self._auto_threading_inflight: set[str] = set()
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -6814,6 +6818,12 @@ class DiscordAdapter(BasePlatformAdapter):
         retried once after a short backoff so transient connect errors
         (e.g. ``Cannot connect to host discord.com:443``) don't immediately
         burn through to the caller's failure path (#20243).
+
+        The seed message ("Thread created by Hermes: **name**") is sent at
+        most once across both attempts — it is reused for the retry rather
+        than re-sent, so a slow/flaky Discord API can't leave two duplicate
+        seed messages sitting in the channel for what is still a single
+        thread-creation request (#reliability-2.1).
         """
         thread_name = self._derive_auto_thread_name(message.content or "")
         display_name = getattr(getattr(message, "author", None), "display_name", None) or "unknown user"
@@ -6821,6 +6831,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         last_direct_error: Exception | None = None
         last_fallback_error: Exception | None = None
+        seed_msg: Any = None
 
         for attempt in range(2):
             try:
@@ -6833,9 +6844,10 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception as direct_error:
                 last_direct_error = direct_error
                 try:
-                    seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
-                    )
+                    if seed_msg is None:
+                        seed_msg = await message.channel.send(
+                            f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+                        )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
                         auto_archive_duration=1440,
@@ -6851,7 +6863,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
-                        # within a second or two.
+                        # within a second or two. The already-sent seed message
+                        # (if any) carries over to this retry unchanged.
                         await asyncio.sleep(0.75)
                         continue
 
@@ -7754,8 +7767,36 @@ class DiscordAdapter(BasePlatformAdapter):
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
-                thread = await self._auto_create_thread(message)
+            # Slash commands (e.g. /cc-delegate) are explicit, single-purpose
+            # requests, not open-ended conversation. Unlike a free-text
+            # mention, a per-task thread isn't the point, and the command's
+            # own reply is already visible confirmation the request landed.
+            # This reuses the same syntactic check the message-type switch
+            # below uses for MessageType.COMMAND -- it is not content-based
+            # task classification, just routing on a marker Hermes already
+            # computes.
+            is_command_message = normalized_content.startswith("/")
+            message_id_for_thread = str(getattr(message, "id", ""))
+            already_threading = (
+                bool(message_id_for_thread)
+                and message_id_for_thread in self._auto_threading_inflight
+            )
+            if already_threading:
+                logger.debug(
+                    "[%s] Thread creation already in progress for message %s -- "
+                    "skipping duplicate/racing attempt for the same incoming command",
+                    self.name, message_id_for_thread,
+                )
+            if (
+                auto_thread and not skip_thread and not is_voice_linked_channel
+                and not is_reply_message and not already_threading
+            ):
+                if message_id_for_thread:
+                    self._auto_threading_inflight.add(message_id_for_thread)
+                try:
+                    thread = await self._auto_create_thread(message)
+                finally:
+                    self._auto_threading_inflight.discard(message_id_for_thread)
                 if thread:
                     parent_channel_id = str(message.channel.id)
                     is_thread = True
@@ -7772,6 +7813,20 @@ class DiscordAdapter(BasePlatformAdapter):
                     # event is dropped before it can trigger a second agent run.
                     # Fixes #51057.
                     self._dedup.is_duplicate(str(thread.id))
+                elif is_command_message:
+                    # Thread creation failed, but this is an explicit command
+                    # (e.g. /cc-delegate) -- an otherwise-valid delegation
+                    # request must not be discarded just because a cosmetic
+                    # per-task thread couldn't be created. Continue in the
+                    # originating channel/message context instead, exactly
+                    # like the skip_thread path above (thread_id/is_thread
+                    # are left at their pre-block values).
+                    logger.warning(
+                        "[%s] Auto-thread creation failed for command message %s; "
+                        "continuing in the originating channel instead of "
+                        "discarding the request.",
+                        self.name, message_id_for_thread,
+                    )
                 else:
                     # Auto-threading is the configured routing target for this
                     # message; if it fails we must NOT silently fall back to an
