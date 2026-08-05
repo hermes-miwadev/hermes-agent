@@ -145,6 +145,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch"),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
+    CommandDef("cc-delegate",
+               "Delegate a task to an allowlisted, authenticated Claude Code tmux worker",
+               "Session", gateway_only=True, aliases=("cc_delegate",),
+               args_hint="<worker> [--path <dir>] <prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
@@ -1261,7 +1265,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - cc-delegate: deliberate, low-frequency operator delegation to a Claude
+#     Code tmux worker; reached via /hermes cc-delegate on Slack so it
+#     doesn't tip the registry past the 50-cap and clamp another command off.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "cc-delegate"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

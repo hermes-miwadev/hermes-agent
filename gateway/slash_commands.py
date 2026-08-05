@@ -27,7 +27,10 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import TYPE_CHECKING, Any, Optional, Union
+
+if TYPE_CHECKING:
+    from agent.claude_code_delegate import DelegateRequest
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
@@ -3186,6 +3189,96 @@ class GatewaySlashCommandsMixin:
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return t("gateway.background.started", preview=preview, task_id=task_id)
+
+    async def _handle_cc_delegate_command(self, event: MessageEvent) -> str:
+        """Handle /cc-delegate <worker> [--path <dir>] <prompt>.
+
+        Explicit operator delegation to an allowlisted, already-authenticated
+        Claude Code tmux worker (agent/claude_code_tmux_bridge.py). This is a
+        deliberate, single-purpose command: it does not classify or route
+        tasks automatically, never creates a tmux session on the operator's
+        behalf, and never falls back to the Hermes/OpenAI agent loop -- a
+        failed delegation is reported as-is, not silently retried elsewhere.
+
+        Validation (worker allowlisted, path contained within the worker's
+        workspace, prompt non-empty) and result formatting live in
+        agent/claude_code_delegate.py so they're testable without a running
+        gateway.
+        """
+        from agent.claude_code_delegate import (
+            DelegateValidationError,
+            build_request,
+            format_ack,
+            parse_delegate_args,
+        )
+
+        raw_args = event.get_command_args()
+        try:
+            worker_name, requested_path, prompt = parse_delegate_args(raw_args)
+            request = build_request(worker_name, requested_path, prompt)
+        except DelegateValidationError as exc:
+            return f"❌ {exc}"
+
+        source = event.source
+        event_message_id = self._reply_anchor_for_event(event)
+
+        # Fire-and-forget: the bridge call blocks on tmux polling for up to
+        # its configured timeout (default 300s), so it must not hold up the
+        # gateway's event loop or this command's reply.
+        _task = asyncio.create_task(
+            self._run_cc_delegate_task(request, source, event_message_id=event_message_id)
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        return format_ack(request)
+
+    async def _run_cc_delegate_task(
+        self,
+        request: "DelegateRequest",
+        source: "SessionSource",
+        event_message_id: Optional[str] = None,
+    ) -> None:
+        """Submit the delegated prompt to the tmux bridge and deliver the result.
+
+        Runs the (blocking) bridge call off the event loop via a thread, then
+        sends the sanitised response -- or the mapped error status -- back to
+        the chat the command was invoked from.
+        """
+        from agent.claude_code_delegate import format_result
+        from agent.claude_code_tmux_bridge import submit_prompt
+
+        adapter = self._adapter_for_source(source)
+        if not adapter:
+            logger.warning(
+                "No adapter for platform %s in cc-delegate task (worker=%s)",
+                source.platform, request.worker_name,
+            )
+            return
+
+        thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+
+        try:
+            result = await asyncio.to_thread(
+                submit_prompt, request.worker_name, request.bridge_prompt
+            )
+        except Exception as exc:
+            logger.exception(
+                "cc-delegate: unexpected error calling bridge for worker %s",
+                request.worker_name,
+            )
+            await adapter.send(
+                chat_id=source.chat_id,
+                content=f"⚠️ Delegation to `{request.worker_name}` failed: {exc}",
+                metadata=thread_metadata,
+            )
+            return
+
+        await adapter.send(
+            chat_id=source.chat_id,
+            content=format_result(request.worker_name, result),
+            metadata=thread_metadata,
+        )
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast
