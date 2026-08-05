@@ -245,6 +245,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/rollback [number]` | List or restore filesystem checkpoints. |
 | `/diff [staged\|all\|session] [--stat]` | Show git changes in the working directory (fenced and truncated to platform message limits). `session` shows the cumulative diff of everything Hermes changed; `--stat` shows just the summary. |
 | `/background <prompt>` | Run a prompt in a separate background session. Results are delivered back to the same chat when the task finishes. See [Messaging Background Sessions](/user-guide/messaging/#background-sessions). |
+| `/cc-delegate <worker> [--path <dir>] <prompt>` (alias: `/cc_delegate`) | Deliberately delegate a task to an allowlisted, already-authenticated Claude Code CLI session running in tmux — a separate agent from Hermes itself, not the `/claude-code` skill (which teaches *Hermes* to drive Claude Code as a tool). Only pre-registered workers can be targeted (`claude-momentum`, workspace `/home/michael/code`, by default); an optional `--path`/`--repo` must resolve inside that worker's workspace or the command is rejected. Sends an immediate acknowledgement, then delivers the worker's sanitised response (or a timeout/busy/auth-failure/session-missing status) back to the same chat. Never creates a tmux session and never falls back to the normal Hermes agent loop. See [agent/claude_code_tmux_bridge.py](https://github.com/NousResearch/hermes-agent/blob/main/agent/claude_code_tmux_bridge.py). |
 | `/queue <prompt>` (alias: `/q`) | Queue a prompt for the next turn without interrupting the current one. |
 | `/steer <prompt>` | Inject a message after the next tool call without interrupting — the model picks it up on its next iteration rather than as a new turn. |
 | `/goal <text>` | Set a standing goal Hermes works toward across turns — our take on the Ralph loop. A judge model checks after each turn; if not done, Hermes auto-continues until it is, you pause/clear it, or the turn budget (default 20) is hit. Subcommands: `/goal status`, `/goal pause`, `/goal resume`, `/goal clear`. Safe to run mid-agent for status/pause/clear; setting a new goal requires `/stop` first. See [Persistent Goals](/user-guide/features/goals). |
@@ -279,13 +280,28 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/help` | Show messaging help. |
 | `/<skill-name>` | Invoke any installed skill by name. |
 
+### Delegating to a Claude Code worker (`/cc-delegate`)
+
+Only for the explicit, deliberate case where you want a *separate*, already-running Claude Code CLI session — not Hermes itself — to pick up a task. Nothing about a message routes here automatically; you have to type the command.
+
+```
+/cc-delegate claude-momentum Add a retry with backoff to the fetch_report() call
+
+/cc-delegate claude-momentum --path hermes-agent/gateway Fix the flaky test in test_slack.py
+```
+
+- `<worker>` must be a session registered in `agent/claude_code_tmux_bridge.py` (only `claude-momentum` ships by default). Unregistered names are rejected outright, not fuzzy-matched.
+- `--path <dir>` (or `--repo <dir>`) is optional and must resolve to the worker's workspace root or a subdirectory of it — anything else (`..` traversal, an absolute path elsewhere, a symlink escape) is rejected before anything is sent to tmux.
+- The command replies twice: an immediate "delegating..." acknowledgement naming the worker and workspace, then a follow-up once the worker responds (or times out / reports busy / needs re-authentication / has no live session).
+- The follow-up contains only the worker's own reply text — no pane history, prompts, tokens, or ANSI control sequences.
+
 ## Notes
 
 - `/skin`, `/snapshot`, `/reload`, `/tools`, `/toolsets`, `/browser`, `/config`, `/cron`, `/platforms`, `/paste`, `/image`, `/statusbar`, `/battery`, `/focus`, `/plugins`, `/busy`, `/indicator`, `/wake`, `/journey`, `/redraw`, `/clear`, `/history`, `/save`, `/copy`, `/handoff`, `/prompt`, `/pet`, `/hatch`, `/timestamps`, `/subscription`, and `/quit` are **CLI-only** commands.
 - `/skills` is **CLI-only for search/browse/install**; its write-approval review subcommands (`pending`, `approve`, `reject`, `diff`, `approval`) also work on messaging platforms when `skills.write_approval` is on. `/memory` works on **both** surfaces.
 - `/verbose` is **CLI-only by default**, but can be enabled for messaging platforms by setting `display.tool_progress_command: true` in `config.yaml`. When enabled, it cycles the `display.tool_progress` mode and saves to config.
 - `/focus` and `/verbose` share one suppression path (`display.tool_progress`), so they can never contradict each other: `/focus on` pins tool progress to `off` and stashes your mode under `display.focus_saved_tool_progress`; `/focus off` restores it; cycling `/verbose` while focus is on takes the mode back and clears the focus badge. Focus view is display-only — it never changes conversation history, the system prompt, or anything sent to the model, so it has zero prompt-cache impact.
-- `/sethome`, `/restart`, `/approve`, `/deny`, `/topic`, `/platform`, and `/commands` are **messaging-only** commands.
+- `/sethome`, `/restart`, `/approve`, `/deny`, `/topic`, `/platform`, `/commands`, and `/cc-delegate` are **messaging-only** commands.
 - `/status`, `/egress`, `/version`, `/whoami`, `/background`, `/queue`, `/steer`, `/voice`, `/reload-mcp`, `/reload-skills`, `/rollback`, `/diff`, `/debug`, `/fast`, `/approvals`, `/footer`, `/curator`, `/kanban`, `/topup`, `/suggestions`, `/blueprint`, `/learn`, `/init`, `/sessions`, and `/yolo` work in **both** the CLI and the messaging gateway.
 - `/voice join`, `/voice channel`, and `/voice leave` are only meaningful on Discord.
 - In the TUI, `/sessions` shows live sessions in the current TUI process. Use `/resume [name]` or `hermes --tui --resume <id-or-title>` for saved or closed transcripts.

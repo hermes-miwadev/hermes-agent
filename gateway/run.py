@@ -15203,6 +15203,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "background":
             return await self._handle_background_command(event)
 
+        if canonical == "cc-delegate":
+            return await self._handle_cc_delegate_command(event)
+
         if canonical == "queue":
             queue_payload = event.get_command_args().strip()
             if not queue_payload:
